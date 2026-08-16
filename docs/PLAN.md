@@ -3,7 +3,7 @@
 > Status: **all Tier-1 decisions made.** Section 8 is the decision register; Tier-2 items
 > are decided at the relevant stage.
 >
-> Last updated: 2026-08-17
+> Last updated: 2026-08-16
 
 ---
 
@@ -668,16 +668,16 @@ An untested backup is not a backup. Schedule as a stage 2 maintenance job (§5.5
 ```
 homelab/
 ├── docs/                      # this plan, runbooks, decision records
-├── stage1-bootstrap/          # Ansible
+├── stage1/                    # Ansible (bootstrap)
 │   ├── inventory/
 │   ├── playbooks/
 │   └── roles/
-├── stage2-cluster/            # reconciled by mgmt-cluster Flux
+├── stage2/                    # reconciled by mgmt-cluster Flux
 │   ├── flux/
 │   ├── providers/             # CAPI + Proxmox + IPAM + autoscaler
 │   ├── clusters/homelab/      # ClusterClass + Cluster topology
 │   └── maintenance/           # scheduled + manual jobs
-└── stage3-platform/           # reconciled by workload-cluster Flux
+└── stage3/                    # reconciled by workload-cluster Flux
     ├── clusters/homelab/
     ├── infrastructure/
     ├── observability/
@@ -827,7 +827,7 @@ must not block the autoscaler.
 | **E. Hybrid: Proxmox CSI (RWO) + Longhorn *or* NFS (RWX) + Garage (S3)** ⭐ | Each workload gets the right primitive; Postgres gets low-overhead block storage; RWX and S3 exist without paying Ceph's tax | Three systems instead of one; more to learn and monitor |
 | **F. SeaweedFS** | The closest thing to "one system for everything" short of Ceph: S3 API + POSIX filer + a CSI driver that does RWX; far lighter than Ceph | PVCs are FUSE mounts of the filer, so database workloads are a poor fit — you'd still want block storage for Postgres; smaller community than Longhorn/Ceph; another distributed system to operate |
 
-**Decided: E** *(2026-08-17)* — and the two-tier storage layout in §2.3 makes it clear-cut.
+**Decided: E** *(2026-08-16)* — and the two-tier storage layout in §2.3 makes it clear-cut.
 
 The concrete shape:
 
@@ -870,7 +870,7 @@ POSIX volumes as its primary function, with S3 layered on top — see the note u
 why an S3-only solution (MinIO, Garage, or any other) cannot serve PVCs. F and JuiceFS come
 closest to unifying the three, but both still want real block storage under the databases.
 
-**Choose:** ☐ A  ☐ B  ☐ C  ☐ D  ☑ **E — Proxmox CSI (tiered) + NFS RWX + Garage** *(decided 2026-08-17)*  ☐ F
+**Choose:** ☐ A  ☐ B  ☐ C  ☐ D  ☑ **E — Proxmox CSI (tiered) + NFS RWX + Garage** *(decided 2026-08-16)*  ☐ F
 
 ---
 
@@ -888,6 +888,64 @@ public repo exists, since ExternalSecret manifests carry only references and can
 open repo as documentation.
 
 **Choose:** ☑ **A — SOPS + age, secrets in a private repo** *(decided 2026-08-16)*  ☐ B  ☐ C
+
+---
+
+#### D14. Backup & disaster recovery
+Per §2 this is the *actual* resilience story. Layers, not alternatives.
+- **A. Proxmox Backup Server (VM-level)** ⭐ — incremental, deduplicated, client-side encrypted; since 4.2 it writes natively to S3, so it targets B2 directly.
+- **B. Velero (Kubernetes-object + PV level)** ⭐ — namespace-granular restore; the right tool for "I deleted a namespace".
+- **C. CNPG-native backups to object storage** ⭐ — non-negotiable for Postgres; gives PITR.
+- **D. ZFS `send`/`recv` to an off-box target** — efficient, but needs a ZFS receiver; largely made redundant by A once PBS targets B2.
+- **E. Restic/Kopia from inside the cluster** — file-level; effectively what Velero's node-agent uses under the hood.
+
+**Decided: A + B + C, all targeting Backblaze B2.** Full architecture, bucket layout, Object
+Lock guidance and the B2-specific gotchas are in **§6.7**. **D** is worth adding later only if
+you acquire a second ZFS box on-site.
+
+**Choose:** ☑ **A** + ☑ **B** + ☑ **C** → Backblaze B2 *(decided 2026-08-16)*  ☐ D  ☐ E
+
+---
+
+#### D15. Repository strategy
+- **A. Monorepo (this repo), three top-level directories** ⭐ — one place, atomic cross-stage changes, simplest to navigate. Flux handles multiple paths/branches fine.
+- **B. Separate repos per stage** — cleaner RBAC and blast radius; more overhead for a single operator.
+- **C. Monorepo + self-hosted Git (Gitea/Forgejo) mirroring to GitHub** — removes GitHub as a hard dependency for reconciliation; adds a service that itself needs backing up (and a bootstrap dependency).
+
+**Recommendation: A for configuration** — one public monorepo across all three stages —
+**plus a second private repo for secrets only**, which is a visibility split rather than a
+stage split. See §7.1. This is orthogonal to A/B/C: the secrets repo exists because of
+publication, not because of stage boundaries.
+
+Consider **C** later if you want the homelab to keep reconciling with no internet access.
+
+**Choose:** ☑ **A — public config monorepo + private secrets repo** *(decided 2026-08-16)*  ☐ B  ☐ C
+
+---
+
+#### D16. Object storage (S3) — needed by CNPG backups, Loki, Velero
+- **A. Garage** ⭐ — lightweight, simple, designed for self-hosting; low RAM; actively developed.
+- **B. MinIO** — ⚠️ **the upstream open-source repository was archived on 2026-02-12** ("no longer maintained") after community development ended in favour of the proprietary AIStor product; the admin console was already removed from Community Edition in mid-2025. The OpenMaxIO fork that responded to this is dormant. The live community continuation is `pgsty/minio` (AGPLv3, backports CVE patches). Still technically capable, but no longer a sensible default for a new build.
+- **C. Ceph RGW** — only sensible if D7=A.
+- **D. External — Backblaze B2** ⭐ — genuinely off-box, which is exactly what §2 demands for backups; ~$6–7/TB/month with free egress up to 3× stored.
+
+**Decided: D (Backblaze B2) for all backups** *(2026-08-16)* — see §6.7. **A (Garage) remains
+recommended for in-cluster S3** where the data is hot, regenerable and not worth per-GB cost:
+Loki chunks, artifact caches, app object storage. Garage's own data then gets backed up to B2
+like anything else.
+
+The split matters: B2 is for the copies you need when the machine is gone; Garage is for the
+copies you need at local latency. Backups must never live on the machine they're protecting.
+
+> **Note — object storage cannot be the *only* storage layer.** S3 serves an HTTP API, not
+> block devices or POSIX filesystems, so it cannot back a PVC for Postgres, etcd or
+> Prometheus. S3-backed CSI drivers (`csi-s3`, Mountpoint-S3, geesefs) mount buckets over
+> FUSE with no real file locking, non-atomic renames and poor random-write performance —
+> acceptable for media and write-once blobs, unsafe for databases. Object storage in this
+> design is a **backup and bulk-data target**, layered on top of real block storage, never a
+> replacement for it.
+
+**Choose:** ☐ A  ☐ B  ☐ C  ☑ **D — Backblaze B2 for backups, Garage for in-cluster S3** *(decided 2026-08-16)*
 
 ---
 
@@ -984,58 +1042,6 @@ and logs cannot silently fill the pool — alert on ZFS pool usage at 75%.
 
 **Choose:** ☐ A  ☐ B  ☐ C  ☐ D
 
-#### D14. Backup & disaster recovery
-Per §2 this is the *actual* resilience story. Layers, not alternatives.
-- **A. Proxmox Backup Server (VM-level)** ⭐ — incremental, deduplicated, client-side encrypted; since 4.2 it writes natively to S3, so it targets B2 directly.
-- **B. Velero (Kubernetes-object + PV level)** ⭐ — namespace-granular restore; the right tool for "I deleted a namespace".
-- **C. CNPG-native backups to object storage** ⭐ — non-negotiable for Postgres; gives PITR.
-- **D. ZFS `send`/`recv` to an off-box target** — efficient, but needs a ZFS receiver; largely made redundant by A once PBS targets B2.
-- **E. Restic/Kopia from inside the cluster** — file-level; effectively what Velero's node-agent uses under the hood.
-
-**Decided: A + B + C, all targeting Backblaze B2.** Full architecture, bucket layout, Object
-Lock guidance and the B2-specific gotchas are in **§6.7**. **D** is worth adding later only if
-you acquire a second ZFS box on-site.
-
-**Choose:** ☑ **A** + ☑ **B** + ☑ **C** → Backblaze B2 *(decided 2026-08-16)*  ☐ D  ☐ E
-
-#### D15. Repository strategy
-- **A. Monorepo (this repo), three top-level directories** ⭐ — one place, atomic cross-stage changes, simplest to navigate. Flux handles multiple paths/branches fine.
-- **B. Separate repos per stage** — cleaner RBAC and blast radius; more overhead for a single operator.
-- **C. Monorepo + self-hosted Git (Gitea/Forgejo) mirroring to GitHub** — removes GitHub as a hard dependency for reconciliation; adds a service that itself needs backing up (and a bootstrap dependency).
-
-**Recommendation: A for configuration** — one public monorepo across all three stages —
-**plus a second private repo for secrets only**, which is a visibility split rather than a
-stage split. See §7.1. This is orthogonal to A/B/C: the secrets repo exists because of
-publication, not because of stage boundaries.
-
-Consider **C** later if you want the homelab to keep reconciling with no internet access.
-
-**Choose:** ☑ **A — public config monorepo + private secrets repo** *(decided 2026-08-16)*  ☐ B  ☐ C
-
-#### D16. Object storage (S3) — needed by CNPG backups, Loki, Velero
-- **A. Garage** ⭐ — lightweight, simple, designed for self-hosting; low RAM; actively developed.
-- **B. MinIO** — ⚠️ **the upstream open-source repository was archived on 2026-02-12** ("no longer maintained") after community development ended in favour of the proprietary AIStor product; the admin console was already removed from Community Edition in mid-2025. The OpenMaxIO fork that responded to this is dormant. The live community continuation is `pgsty/minio` (AGPLv3, backports CVE patches). Still technically capable, but no longer a sensible default for a new build.
-- **C. Ceph RGW** — only sensible if D7=A.
-- **D. External — Backblaze B2** ⭐ — genuinely off-box, which is exactly what §2 demands for backups; ~$6–7/TB/month with free egress up to 3× stored.
-
-**Decided: D (Backblaze B2) for all backups** *(2026-08-16)* — see §6.7. **A (Garage) remains
-recommended for in-cluster S3** where the data is hot, regenerable and not worth per-GB cost:
-Loki chunks, artifact caches, app object storage. Garage's own data then gets backed up to B2
-like anything else.
-
-The split matters: B2 is for the copies you need when the machine is gone; Garage is for the
-copies you need at local latency. Backups must never live on the machine they're protecting.
-
-> **Note — object storage cannot be the *only* storage layer.** S3 serves an HTTP API, not
-> block devices or POSIX filesystems, so it cannot back a PVC for Postgres, etcd or
-> Prometheus. S3-backed CSI drivers (`csi-s3`, Mountpoint-S3, geesefs) mount buckets over
-> FUSE with no real file locking, non-atomic renames and poor random-write performance —
-> acceptable for media and write-once blobs, unsafe for databases. Object storage in this
-> design is a **backup and bulk-data target**, layered on top of real block storage, never a
-> replacement for it.
-
-**Choose:** ☐ A  ☐ B  ☐ C  ☐ D
-
 ---
 
 ## 9. Risks
@@ -1083,24 +1089,20 @@ times while the Cluster API configuration settles. Don't put real data on it unt
 
 ## 11. Open questions
 
-1. ~~Hardware specs~~ — answered, see §2.1. Remaining hardware details in §2.8.
-2. **Confirm the SAS drives present as raw devices** — the PERC must expose them as
+1. **Confirm the SAS drives present as raw devices** — the PERC must expose them as
    non-RAID/HBA before `hddpool` can be created. It evidently already does for the SATA SSDs,
    but each drive may need explicit conversion.
-3. **Optional: 2 more SSDs as a mirror vdev** (§2.5) — no longer urgent for capacity, but still
+2. **Optional: 2 more SSDs as a mirror vdev** (§2.5) — no longer urgent for capacity, but still
    the clean fix for the PostgreSQL block-size tension (§2.7).
-4. Domain name(s), and is Cloudflare already managing the zone?
-5. Is there an existing router/firewall that should keep doing DHCP, or does `netcore` own it?
-6. Do you want the internal Gateway reachable over VPN (WireGuard/Tailscale) as well as LAN?
-7. ~~Off-box backup target~~ — answered: **Backblaze B2**, see §6.7.
-8. Any existing workloads or data to migrate, or is this greenfield? In particular, is there
+3. Domain name(s), and is Cloudflare already managing the zone?
+4. Is there an existing router/firewall that should keep doing DHCP, or does `netcore` own it?
+5. Do you want the internal Gateway reachable over VPN (WireGuard/Tailscale) as well as LAN?
+6. Any existing workloads or data to migrate, or is this greenfield? In particular, is there
    existing NAS data that needs importing into `hddpool/nas`?
-9. Any GPU/transcoding requirement that needs PCIe passthrough planned in stage 1?
-10. ~~D11 (secrets)~~ — answered: **SOPS + age, secrets in a private repo**, see §7.1.
-11. Do you want the hardware inventory and IP plan (§2.1, §4.7) kept out of the public repo?
-    See the closing note in §7.1.
-12. How loud/hot is acceptable? 3 SAS HDDs in a 1U R640 add noise and heat — irrelevant in a
-    rack, noticeable in a home office.
+7. Any GPU/transcoding requirement that needs PCIe passthrough planned in stage 1?
+8. Do you want the hardware inventory and IP plan (§2.1, §4.7) kept out of the public repo?
+   See the closing note in §7.1.
+9. How loud/hot is acceptable? 3 SAS HDDs in a 1U R640 add noise and heat — irrelevant in a
+   rack, noticeable in a home office.
 
 **All Tier-1 decisions are made** (D1, D2, D3, D7, D11, D14, D15, D16). Phase 0 can begin.
-```
