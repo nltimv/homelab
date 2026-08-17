@@ -43,7 +43,7 @@ stages that each have a clear boundary and a clear "break glass" story.
 | RAM | **512 GB DDR4 ECC** |
 | Boot | 2× consumer NVMe on a PCIe card, **RAID1 + LVM**, ~150 GB free |
 | SSD tier | 3× SATA SSD in **ZFS RAID-Z1**, **1.8 TB usable** |
-| HDD tier | 3× SAS HDD, 1.8 TB each — **unconfigured**, ~3.6 TB usable as RAID-Z1 |
+| HDD tier | 4× SAS HDD, 1.8 TB each — **unconfigured**, ~5.4 TB usable as RAID-Z1 |
 
 ### 2.2 What this means
 
@@ -82,7 +82,7 @@ Consequences, in order of importance:
 - **Autoscaling is bounded by SSD-tier disk, not RAM.** Each burst node needs a root disk. With
   512 GB RAM the autoscaler will never run out of memory; it can absolutely fill `ssdpool`. §5.4.
 - **Keep every pool under ~80% full.** ZFS performance and fragmentation degrade badly past
-  that, so working budgets are **~1.44 TB** (SSD) and **~2.88 TB** (HDD).
+  that, so working budgets are **~1.44 TB** (SSD) and **~4.32 TB** (HDD).
 - **Dual-socket NUMA.** Large VMs should either fit within one NUMA node or have NUMA topology
   exposed in Proxmox, or you'll pay a memory-latency penalty. Relevant for the bigger workers.
 - **The Proxmox host is the largest SPOF and is not managed by stages 2 or 3.** That's why
@@ -101,7 +101,7 @@ RAID-Z1 is not a backup. See D14.
 |---|---|---|---|---|
 | **boot** | 2× consumer NVMe | RAID1 + LVM | ~150 GB free | Proxmox OS, ISOs, CT templates, **PBS chunk cache** — regenerable data *only* |
 | **`ssdpool`** | 3× SATA SSD | ZFS RAID-Z1 *(existing)* | 1.8 TB | VM disks, etcd, PostgreSQL, hot RWO PVs |
-| **`hddpool`** | 3× SAS HDD | ZFS RAID-Z1 *(to create)* | ~3.6 TB | NAS datasets, bulk/cold PVs, NFS RWX exports, **PBS local datastore** |
+| **`hddpool`** | 4× SAS HDD | ZFS RAID-Z1 *(to create)* | ~5.4 TB | NAS datasets, bulk/cold PVs, NFS RWX exports, **PBS local datastore** |
 
 This maps onto Kubernetes as three StorageClasses, which is the neat part — Proxmox CSI
 exposes each Proxmox storage separately, so tiering costs nothing extra:
@@ -109,8 +109,13 @@ exposes each Proxmox storage separately, so tiering costs nothing extra:
 | StorageClass | Backed by | Access | For |
 |---|---|---|---|
 | `proxmox-ssd` | `ssdpool` | RWO | PostgreSQL, metrics TSDB, anything latency-sensitive |
-| `proxmox-hdd` | `hddpool` | RWO | Media, Loki chunks, Garage backing store, bulk app data |
-| `nfs-nas` | `hddpool/nas` via NFS | **RWX** | Shared volumes, Nextcloud, anything multi-pod |
+| `proxmox-hdd` | `hddpool` | RWO | Media, Loki chunks, bulk app data |
+
+RWX volumes (`nfs-nas`) aren't a StorageClass at all — no CSI driver, no dynamic
+provisioning. For the handful of shared volumes a homelab actually needs (Nextcloud, maybe
+one media share), each is a **static PV/PVC pair** defined in Git, pointing directly at
+`hddpool/nas` over NFS. One fewer controller running in the cluster, at the cost of writing
+a PV by hand instead of just requesting a PVC.
 
 #### Why the boot NVMe should not hold VM disks
 
@@ -135,11 +140,11 @@ A single dataset serves both needs, which is the tidiest part of this design:
 - `hddpool/nas` is exported by a **lightweight `nas` LXC running Samba + NFS**, configured by
   stage 1 Ansible. Being outside Kubernetes, **the file shares keep working when the cluster is
   down** — which matters for a household NAS.
-- The **same NFS export** backs the `nfs-nas` RWX StorageClass. This answers D7's outstanding
-  RWX question with no additional moving parts.
-- "Cloud storage" (sync clients, sharing, mobile apps) is **Nextcloud in the cluster** on an
-  `nfs-nas` RWX volume pointed at that dataset — so SMB users and cluster workloads see the
-  *same files*, rather than two copies to reconcile.
+- The **same NFS export** backs the `nfs-nas` static RWX volumes. This answers D7's outstanding
+  RWX question with no additional moving parts — not even a CSI driver.
+- "Cloud storage" (sync clients, sharing, mobile apps) is **Nextcloud in the cluster** on a
+  static `nfs-nas` RWX volume pointed at that dataset — so SMB users and cluster workloads see
+  the *same files*, rather than two copies to reconcile.
 
 ### 2.4 Why not TrueNAS (and when it would be right)
 
@@ -167,19 +172,22 @@ What you'd give up by not running it: a polished web UI for shares, snapshot bro
 management. §2.3's `nas` LXC covers the function; it doesn't match the presentation. If the UI
 matters a lot to you, say so — it's a legitimate reason to revisit, and adding an HBA is cheap.
 
-### 2.5 Optional hardware change — add SSDs
+### 2.5 Why `ssdpool` stays a single 3-disk pool
 
-No longer urgent now that the SAS drives cover bulk capacity, but **still worth doing for
-PostgreSQL specifically** (§2.7). The R640 has 8–10 × 2.5" bays.
+A dedicated mirror vdev for PostgreSQL (2 extra SSDs, matched 8K `volblocksize`, no RAID-Z
+parity padding or read-modify-write cost) would be the clean fix for the tension in §2.7 — but
+it isn't worth it here. Actual load is on the order of **~30 transactions/second**, well within
+what a single SSD absorbs even with RAID-Z1's write-amplification tax included, and 512 GB of
+RAM already gives a large ZFS ARC and generous `shared_buffers` to absorb the read side. Buying
+2–3 drives to fix a cost you can't measure isn't a good trade.
 
-- **2 SSDs as a mirror vdev** dedicated to database volumes. Mirrors have **no parity padding**,
-  so 8K `volblocksize` costs exactly 2× with no waste — fixing both the padding problem and the
-  Postgres read-modify-write problem at once.
-- **Expand `ssdpool`** with `zpool attach`. RAIDZ expansion shipped in OpenZFS 2.3 and is in
-  Proxmox VE 9; it reflows live, one disk per operation. Caveat: existing blocks keep their old
-  parity ratio until rewritten. Confirm `feature@raidz_expansion` first.
+`ssdpool` therefore stays the existing 3× SATA SSD RAID-Z1, hosting VM disks, etcd and
+PostgreSQL together — no dedicated pool, no mirror vdev.
 
-Until then the plan assumes 1.44 TB usable on `ssdpool`.
+If load ever grows enough to revisit this: `zpool attach` (RAIDZ expansion, OpenZFS 2.3+, in
+Proxmox VE 9) can grow `ssdpool` live, one disk at a time, without a rebuild — but only within
+the same RAID-Z1 parity scheme. It adds capacity, not the fix; the block-size tension is only
+actually removed by a mirror, which needs a fresh pool built from scratch, not an expansion.
 
 ### 2.6 Capacity budget (draft)
 
@@ -204,13 +212,13 @@ Talos keeps node disks small, which helps considerably on the SSD tier.
 | **VM subtotal** | | | **~370 GB** |
 | **Remaining for hot RWO PVs (`proxmox-ssd`)** | | | **~1.07 TB** |
 
-**`hddpool` — 3.6 TB raw, ~2.88 TB working budget**
+**`hddpool` — 5.4 TB raw, ~4.32 TB working budget**
 
 | Item | Total |
 |---|---|
 | PBS local datastore (§6.7) | ~1.0 TB |
 | NAS datasets (`hddpool/nas`, SMB + `nfs-nas` RWX) | ~1.2 TB |
-| Bulk/cold RWO PVs (`proxmox-hdd`) — media, Loki, Garage | ~0.6 TB |
+| Bulk/cold RWO PVs (`proxmox-hdd`) — media, Loki chunks | ~0.6 TB |
 
 The SAS tier changes the picture substantially: bulk capacity is no longer scarce, and the
 SSD tier now carries only VMs and latency-sensitive volumes.
@@ -226,7 +234,7 @@ Replication multipliers still decide D7 on the **SSD tier**, where headroom is f
 
 RAM was never going to decide this. Disk does, and decisively.
 
-### 2.7 The PostgreSQL block-size tension
+### 2.7 The PostgreSQL block-size tension — accepted at this workload
 
 Worth stating explicitly because it affects D13's deployment, not just D7:
 
@@ -234,13 +242,14 @@ Worth stating explicitly because it affects D13's deployment, not just D7:
 - 3-disk RAID-Z1 wants ≥16K `volblocksize` to avoid padding waste.
 - 16K blocks + 8K writes = read-modify-write amplification on every page write.
 
-Options, best first:
-1. **Add a mirror vdev (§2.5) and put Postgres there with 8K `volblocksize`.** No padding
-   penalty on mirrors, no RMW. Clean fix.
-2. Accept 16K and the amplification. SSDs absorb it reasonably well, and with 512 GB of RAM
-   a large ZFS ARC plus generous `shared_buffers` will absorb much of the read side.
-3. Set `full_page_writes=off` — **only** safe because ZFS provides atomic writes. Reduces WAL
-   volume significantly. Verify carefully before relying on this.
+**Decided: accept it, on 16K `volblocksize`.** The theoretical fix — a dedicated mirror vdev
+with matched 8K `volblocksize` (§2.5) — has no RMW cost at all, but isn't worth the extra
+drives here: at the actual expected load (~30 transactions/second), even doubled write cost
+from RMW amplification is nowhere near what a single SSD can absorb, and 512 GB of RAM gives
+both a large ZFS ARC and generous `shared_buffers`, which covers most of the read side anyway.
+
+`full_page_writes=off` (safe specifically because ZFS's own writes are atomic) is available as
+a further tuning knob if this ever needs revisiting, but isn't necessary at the current scale.
 
 ### 2.8 Remaining hardware questions
 
@@ -249,7 +258,7 @@ Options, best first:
 - Does Proxmox boot from the 3 SSDs, or from a BOSS/M.2 card?
 - Is the PERC controller in HBA/IT (non-RAID) mode? ZFS requires it — presumably yes if
   RAID-Z1 is genuinely ZFS, but worth confirming.
-- Free drive bays: how many? (Determines §2.5.)
+- Free drive bays: how many? Confirms there's room for the 4th SAS HDD.
 
 ---
 
@@ -263,7 +272,7 @@ Options, best first:
 │                                                                     │
 │  storage tiers:  boot NVMe (ISOs, PBS cache)                        │
 │                  ssdpool  1.8 TB  → VM disks, hot PVs               │
-│                  hddpool  3.6 TB  → NAS, bulk PVs, PBS local        │
+│                  hddpool  5.4 TB  → NAS, bulk PVs, PBS local        │
 │                                                                     │
 │  ── STAGE 1 ─────────────────────────────────────────────────────   │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                 │
@@ -287,7 +296,7 @@ Options, best first:
 │  │  control plane ×3  │ system pool (fixed) │ burst pool      │      │
 │  │                    │ storage, DBs        │ (autoscaled)    │      │
 │  │  ── STAGE 3 (GitOps, reconciled by workload Flux) ───────  │      │
-│  │  CNI · CSI (ssd/hdd/nfs) · Gateway ×2 · cert-manager       │      │
+│  │  CNI · CSI (ssd/hdd) · Gateway ×2 · cert-manager           │      │
 │  │  external-dns · monitoring · CloudNativePG · Nextcloud     │      │
 │  └───────────────────────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -312,10 +321,11 @@ that is still running rather than by a human with a runbook.
 
 ### 4.1 Proxmox host configuration
 - Enterprise repo off / no-subscription repo on, unattended-upgrade policy
-- **Create `hddpool`** — 3× SAS HDD as ZFS RAID-Z1 (§2.3). Confirm the drives present as raw
-  devices first: the PERC must expose them as non-RAID/HBA, as it evidently already does for
-  the SATA SSDs. Datasets: `hddpool/nas`, `hddpool/pbs`, plus a Proxmox storage for
-  `proxmox-hdd` volumes.
+- **Create `hddpool`** — 4× SAS HDD as ZFS RAID-Z1 (§2.3). The 4th drive doesn't need to match
+  the others' model — same interface (SAS), comparable capacity and RPM is enough. Confirm the
+  drives present as raw devices first: the PERC must expose them as non-RAID/HBA, as it
+  evidently already does for the SATA SSDs. Datasets: `hddpool/nas`, `hddpool/pbs`, plus a
+  Proxmox storage for `proxmox-hdd` volumes.
 - **ZFS tuning — the highest-value items on this hardware:**
   - **`volblocksize` ≥ 16K** on both ZFS storages. On 3-disk RAID-Z1 the old 8K default
     costs ~166% of nominal space (§2.2). Verify the current setting; note it only applies to
@@ -352,7 +362,8 @@ Proxmox and against the management cluster.
 Bind-mounts `hddpool/nas` and exports it two ways (§2.3):
 
 - **SMB** for household/desktop access — available whether or not Kubernetes is running
-- **NFS** as the backing export for the cluster's `nfs-nas` RWX StorageClass
+- **NFS** as the backing export for the cluster's `nfs-nas` RWX volumes (static PVs, no CSI
+  driver)
 
 Both views are the *same dataset*, so Nextcloud in the cluster and a laptop over SMB see the
 same files. Users, shares and exports are all defined in Ansible. Snapshots come from ZFS on
@@ -543,7 +554,7 @@ constraint bites hardest. → **Decision D7.** Requirements to weigh:
 
 - **RWO block** for Postgres and most apps — needs to be fast and to survive node churn
 - **RWX shared** for media libraries, shared config, some apps
-- **S3-compatible object storage** for CNPG backups, Loki chunks, Velero → **D16**
+- **S3-compatible object storage** for CNPG backups and Velero → **D16**
 - Snapshots + a path to off-box backup → **D14**
 - Must not fight the autoscaler (§5.4)
 
@@ -610,7 +621,6 @@ credential living inside the Kubernetes cluster must not be able to erase your V
 | `homelab-pbs` | Proxmox Backup Server | read/write, no delete where possible |
 | `homelab-pgbackup` | CloudNativePG | read/write |
 | `homelab-velero` | Velero | read/write |
-| `homelab-loki` *(optional)* | Loki long-term chunks | read/write |
 
 #### Object Lock — enable it, with one caveat to verify
 
@@ -827,21 +837,24 @@ must not block the autoscaler.
 | **E. Hybrid: Proxmox CSI (RWO) + Longhorn *or* NFS (RWX) + Garage (S3)** ⭐ | Each workload gets the right primitive; Postgres gets low-overhead block storage; RWX and S3 exist without paying Ceph's tax | Three systems instead of one; more to learn and monitor |
 | **F. SeaweedFS** | The closest thing to "one system for everything" short of Ceph: S3 API + POSIX filer + a CSI driver that does RWX; far lighter than Ceph | PVCs are FUSE mounts of the filer, so database workloads are a poor fit — you'd still want block storage for Postgres; smaller community than Longhorn/Ceph; another distributed system to operate |
 
-**Decided: E** *(2026-08-17)* — and the two-tier storage layout in §2.3 makes it clear-cut.
-
-The concrete shape:
+**Decided: E, simplified further** *(2026-08-17)* — the two-tier storage layout in §2.3 makes
+the RWO/RWX split clear-cut, and two more pieces of the original hybrid turned out to be
+solving problems this deployment doesn't have: a dedicated in-cluster S3 system (Garage) for a
+Loki instance that can just use a filesystem-backed PVC, and a CSI driver for RWX volumes when
+there are only one or two of them. Both are cut. What remains:
 
 | Need | Component | Backed by | Overhead |
 |---|---|---|---|
 | Hot RWO block (Postgres, metrics TSDB) | **Proxmox CSI** → `proxmox-ssd` | `ssdpool` | 1× |
-| Bulk RWO block (media, Loki, Garage) | **Proxmox CSI** → `proxmox-hdd` | `hddpool` | 1× |
-| RWX shared (Nextcloud, multi-pod) | **NFS CSI driver** → `nfs-nas` | `hddpool/nas`, exported by the `nas` LXC | 1× |
-| S3 (Loki chunks, app object storage) | **Garage** on a `proxmox-hdd` volume | `hddpool` | 1× |
-| S3 (backups) | **Backblaze B2** — off-box, §6.7 | — | — |
+| Bulk RWO block (media, Loki chunks) | **Proxmox CSI** → `proxmox-hdd` | `hddpool` | 1× |
+| RWX shared (Nextcloud, multi-pod) | **Static PV/PVC**, no CSI driver | `hddpool/nas`, exported by the `nas` LXC | 1× |
+| S3 (backups only) | **Backblaze B2** — off-box, §6.7 | — | — |
 
 The RWX question that was holding this decision open is answered by §2.3: the NAS dataset and
-the RWX StorageClass are **the same dataset**, so SMB users and cluster workloads see the same
-files and there's no second system to run.
+the RWX volumes point at **the same dataset**, so SMB users and cluster workloads see the same
+files and there's no second system to run. There's no in-cluster S3 at all right now — if a
+future app genuinely needs one (something that only speaks S3), Garage is a cheap add-back at
+that point; this isn't a door closed, just one not walked through before it's needed.
 
 Why, given §2.6:
 
@@ -870,7 +883,7 @@ POSIX volumes as its primary function, with S3 layered on top — see the note u
 why an S3-only solution (MinIO, Garage, or any other) cannot serve PVCs. F and JuiceFS come
 closest to unifying the three, but both still want real block storage under the databases.
 
-**Choose:** ☐ A  ☐ B  ☐ C  ☐ D  ☑ **E — Proxmox CSI (tiered) + NFS RWX + Garage** *(decided 2026-08-17)*  ☐ F
+**Choose:** ☐ A  ☐ B  ☐ C  ☐ D  ☑ **E (simplified) — Proxmox CSI (tiered) + static NFS RWX, no in-cluster S3** *(decided 2026-08-17)*  ☐ F
 
 ---
 
@@ -969,8 +982,9 @@ purely on **disk footprint**, which is the constrained resource (§2.2). If you'
 the turnkey dashboards and alert rules of **A**, that's entirely reasonable; just cap local
 retention (7–15 days) and ship anything longer to object storage.
 
-Either way: keep Loki chunk retention short locally and push to Garage, and make sure metrics
-and logs cannot silently fill the pool — alert on ZFS pool usage at 75%.
+Either way: keep Loki chunk retention short and stored locally on `proxmox-hdd` (D16 — no
+in-cluster S3), and make sure metrics and logs cannot silently fill the pool — alert on ZFS
+pool usage at 75%.
 
 **Choose:** ☐ A  ☐ B  ☐ C
 
@@ -1018,13 +1032,14 @@ Consider **C** later if you want the homelab to keep reconciling with no interne
 - **C. Ceph RGW** — only sensible if D7=A.
 - **D. External — Backblaze B2** ⭐ — genuinely off-box, which is exactly what §2 demands for backups; ~$6–7/TB/month with free egress up to 3× stored.
 
-**Decided: D (Backblaze B2) for all backups** *(2026-08-16)* — see §6.7. **A (Garage) remains
-recommended for in-cluster S3** where the data is hot, regenerable and not worth per-GB cost:
-Loki chunks, artifact caches, app object storage. Garage's own data then gets backed up to B2
-like anything else.
+**Decided: D (Backblaze B2) for all backups** *(2026-08-16)* — see §6.7. **No in-cluster S3
+(A/Garage) for now** *(revised 2026-08-17)* — Loki is the only current consumer of "hot" S3,
+and at this scale it's simpler to just give it a filesystem-backed PVC on `proxmox-hdd` (D12)
+than to run and back up a whole extra object-storage system for it. Revisit Garage if a future
+app genuinely needs an S3 API and a plain PVC won't do.
 
-The split matters: B2 is for the copies you need when the machine is gone; Garage is for the
-copies you need at local latency. Backups must never live on the machine they're protecting.
+Backups must never live on the machine they're protecting — B2 is the only S3 target in this
+design, and it's off-box by construction.
 
 > **Note — object storage cannot be the *only* storage layer.** S3 serves an HTTP API, not
 > block devices or POSIX filesystems, so it cannot back a PVC for Postgres, etcd or
@@ -1034,7 +1049,7 @@ copies you need at local latency. Backups must never live on the machine they're
 > design is a **backup and bulk-data target**, layered on top of real block storage, never a
 > replacement for it.
 
-**Choose:** ☐ A  ☐ B  ☐ C  ☐ D
+**Choose:** ☐ A  ☐ B  ☐ C  ☑ **D — Backblaze B2, no in-cluster S3** *(decided 2026-08-16, revised 2026-08-17)*
 
 ---
 
@@ -1043,10 +1058,11 @@ copies you need at local latency. Backups must never live on the machine they're
 | Risk | Impact | Mitigation |
 |---|---|---|
 | CAPMOX API instability (`v1alpha2` → `v1alpha3`) | Breaking changes on upgrade | Pin provider versions; read release notes; never bump blind; keep a tested rollback |
-| **ZFS pool fills up** | Writes fail cluster-wide; severe performance degradation past 80% | The main capacity risk on this hardware. Alert at 75%; cap Prometheus/Loki retention; conservative autoscaler `max-size`; add disks (§2.5) |
+| **ZFS pool fills up** | Writes fail cluster-wide; severe performance degradation past 80% | The main capacity risk on this hardware. Alert at 75%; cap Prometheus/Loki retention; conservative autoscaler `max-size`; add disks via `zpool attach` (§2.5) |
 | 8K `volblocksize` left in place on RAID-Z1 | ~166% space usage — hundreds of GB wasted | Verify and set ≥16K in stage 1 (§4.1); migrate any existing volumes |
 | Autoscaler exceeds host disk capacity | Pool fills; new VMs fail to start | Explicit capacity budget (§2.6); conservative `max-size`; alert on pool usage, not just memory |
-| Postgres write amplification on RAID-Z1 | Poor DB performance | Mirror vdev for DB volumes (§2.5/§2.7), or accept 16K + large ARC |
+| Postgres write amplification on RAID-Z1 | Poor DB performance | Assessed negligible at the actual workload (~30 tps, §2.7); revisit with a mirror vdev only if load grows materially |
+| Second disk failure during an `hddpool` resilver | Pool lost, restore from B2 required | Accepted: the 4 drives are from different sources/ages (uncorrelated wear), and B2 (§6.7) already covers data loss regardless — the cost of bad luck here is restore time, not data |
 | Storage replicas block scale-down | Autoscaler never scales in | Largely avoided by choosing Proxmox CSI over Longhorn/Ceph; split node pools (§5.4) regardless |
 | Single host failure | Total outage | Accepted by design — off-box backups (D14) and a tested rebuild path are the answer |
 | Management cluster loss | Can't reconcile stage 2 | Stage 1 recreates it from Ansible; back up its etcd and the Flux bootstrap secrets |
@@ -1071,7 +1087,7 @@ Each phase should end with something demonstrably working.
 | **5** | Stage 2: ClusterClass, node pools, node image pipeline. *Exit: a version bump rolls the cluster.* |
 | **6** | Stage 2: cluster-autoscaler + capacity budget. *Exit: burst pool scales up and back to zero.* |
 | **7** | Stage 3: Flux, CNI extras, cert-manager, both Gateways, external-dns. *Exit: a test app is reachable internally and externally with valid certs.* |
-| **8** | Stage 3: Proxmox CSI (`proxmox-ssd`, `proxmox-hdd`) + NFS CSI (`nfs-nas`) + Garage. *Exit: PVCs provision on all three classes and snapshot.* |
+| **8** | Stage 3: Proxmox CSI (`proxmox-ssd`, `proxmox-hdd`) + static NFS PVs (`nfs-nas`). *Exit: PVCs provision on both classes and snapshot; the NFS PV mounts and is writable from a pod.* |
 | **9** | Stage 3: monitoring, dashboards, alerting — including **ZFS pool usage alerts at 75%** and iDRAC hardware health. *Exit: alerts reach you.* |
 | **10** | Stage 3: CloudNativePG + B2 backups (mind the §6.7 B2 quirks) + Nextcloud on `nfs-nas`. *Exit: a PITR restore into a fresh cluster succeeds.* |
 | **11** | Maintenance automation, cron jobs, backup/restore drills, runbooks. *Exit: a full rebuild from Git + backups is documented and tested.* |
@@ -1087,8 +1103,8 @@ times while the Cluster API configuration settles. Don't put real data on it unt
 2. **Confirm the SAS drives present as raw devices** — the PERC must expose them as
    non-RAID/HBA before `hddpool` can be created. It evidently already does for the SATA SSDs,
    but each drive may need explicit conversion.
-3. **Optional: 2 more SSDs as a mirror vdev** (§2.5) — no longer urgent for capacity, but still
-   the clean fix for the PostgreSQL block-size tension (§2.7).
+3. ~~Optional: 2 more SSDs as a mirror vdev for PostgreSQL~~ — evaluated and declined: at the
+   actual workload (~30 tps) the RAID-Z1 write-amplification tax is negligible (§2.5, §2.7).
 4. Domain name(s), and is Cloudflare already managing the zone?
 5. Is there an existing router/firewall that should keep doing DHCP, or does `netcore` own it?
 6. Do you want the internal Gateway reachable over VPN (WireGuard/Tailscale) as well as LAN?
@@ -1099,7 +1115,7 @@ times while the Cluster API configuration settles. Don't put real data on it unt
 10. ~~D11 (secrets)~~ — answered: **SOPS + age, secrets in a private repo**, see §7.1.
 11. Do you want the hardware inventory and IP plan (§2.1, §4.7) kept out of the public repo?
     See the closing note in §7.1.
-12. How loud/hot is acceptable? 3 SAS HDDs in a 1U R640 add noise and heat — irrelevant in a
+12. How loud/hot is acceptable? 4 SAS HDDs in a 1U R640 add noise and heat — irrelevant in a
     rack, noticeable in a home office.
 
 **All Tier-1 decisions are made** (D1, D2, D3, D7, D11, D14, D15, D16). Phase 0 can begin.
