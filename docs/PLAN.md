@@ -1,7 +1,7 @@
 # Homelab GitOps Automation — Plan
 
 > **Status: all decisions made** (§9). Phase 0 can begin.
-> Last updated: 2026-08-17.
+> Last updated: 2026-08-19.
 
 ---
 
@@ -256,8 +256,8 @@ atomic) remains available as a further knob if this ever needs revisiting.
    DHCP server + resolver + VPN      10G SFP+ ─► Proxmox (trunk, PVID 10)
                                      10G SFP+ ─► living room (access, v40)
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Proxmox VE host (single node)          vmbr0 vlan-aware, VLAN 10/20  │
-│ configured by Stage 1 Ansible: ZFS, bridges/VLANs, firewall, API     │
+│ Proxmox VE host (single node)          vmbr0 vlan-aware, VLAN 10/20 │
+│ configured by Stage 1 Ansible: ZFS, bridges/VLANs, firewall, API    │
 │ tokens, PBS                                                         │
 │                                                                     │
 │  storage tiers:  boot NVMe (ISOs, PBS cache)                        │
@@ -276,18 +276,18 @@ atomic) remains available as a further knob if this ever needs revisiting.
 │  │ single-node k8s + Flux │               │                         │
 │  └───────────┬────────────┘               │                         │
 │              │                            │                         │
-│  ── STAGE 2 (GitOps, reconciled by mgmt Flux) ────────────────────   │
+│  ── STAGE 2 (GitOps, reconciled by mgmt Flux) ────────────────────  │
 │   Cluster API + Proxmox provider + IPAM   │                         │
 │   cluster-autoscaler                      │  creates / upgrades     │
 │   maintenance jobs (certs, image builds)  │  / repairs              │
 │              ▼                            │                         │
 │  ┌───────────────────────────────────────────────────────────┐      │
-│  │ Workload Kubernetes cluster (VMs, VLAN 20)  ◄──┘           │      │
-│  │  control plane ×3  │ system pool (fixed) │ burst pool      │      │
-│  │                    │ storage, DBs        │ (autoscaled)    │      │
-│  │  ── STAGE 3 (GitOps, reconciled by workload Flux) ───────  │      │
-│  │  Cilium · CSI (ssd/hdd) · Gateway ×2 · cert-manager        │      │
-│  │  external-dns · monitoring · CloudNativePG · Nextcloud     │      │
+│  │ Workload Kubernetes cluster (VMs, VLAN 20)  ◄──┘          │      │
+│  │  control plane ×3  │ system pool (fixed) │ burst pool     │      │
+│  │                    │ storage, DBs        │ (autoscaled)   │      │
+│  │  ── STAGE 3 (GitOps, reconciled by workload Flux) ─────── │      │
+│  │  Cilium · CSI (ssd/hdd) · Gateway ×2 · cert-manager       │      │
+│  │  external-dns · monitoring · CloudNativePG · Nextcloud    │      │
 │  └───────────────────────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────────────────────┘
         │ PBS local datastore (hddpool) ──sync──► Backblaze B2
@@ -391,7 +391,7 @@ it — nothing is built on top of them yet.
 | 1 | — | *none* | **Quarantine.** No SVI, no route. All unused ports park here. |
 | 10 | `10.100.10.0/24` | `.10.2` (gateway) | Infra: switch `.2`, `netcore` `.10`, `runner` `.11`, mgmt cluster VM `.20`, iDRAC `.40`, PVE host `.41` |
 | 20 | `10.100.20.0/24` | `.20.2` (gateway) | Server workloads: Kubernetes nodes, `nas` LXC, **LB VIPs `.200–.250`** |
-| 40 | `10.100.40.0/24` | `.40.2` (gateway) | Clients: PC (`.99`, static), laptops, phones, TV, APs — everything behind the living-room switch |
+| 40 | `10.100.40.0/24` | `.40.2` (gateway) | Clients: PC, laptops, phones, TV, APs — everything behind the living-room switch. All DHCP, no reservations |
 | 50 | `10.100.50.0/24` | `.50.2` (gateway) | IoT / guest — **deferred**, see §4.8 |
 | 99 | `10.100.99.0/30` | `.99.2` | Transit only: OPNsense `.1` ↔ switch `.2`. No hosts. |
 | — | `10.100.98.0/24` | *none* | WireGuard tunnel subnet, lives entirely on OPNsense (§4.6) |
@@ -405,8 +405,8 @@ Two notes on what is deliberately *absent*:
   is no storage replication traffic to isolate.
 
 The `nas` LXC lives in VLAN 20, not VLAN 10, even though it is a stage 1 component: it is a
-service consumed by clients (SMB) and by the cluster (NFS), and the trust hierarchy in §4.5
-would otherwise block SMB from the client VLAN.
+service consumed by clients (SMB) and by the cluster (NFS), so it belongs with the server
+workloads rather than with the infrastructure that manages them.
 
 ### 4.3 Port map — access vs trunk
 
@@ -480,25 +480,34 @@ Stateless ACLs are usually painful because you must hand-write return-traffic ru
 ordering removes almost all of that:
 
 ```
-mgmt (10)  >  servers (20)  >  clients (40) ≈ vpn (98)  >  iot (50)
+mgmt (10) ≈ clients (40) ≈ vpn (98)  >  servers (20)  >  iot (50)
 ```
+
+**Clients and the VPN are a trusted tier, level with mgmt.** Anything on VLAN 40 — and any
+WireGuard peer — reaches mgmt, servers and iot without exception: Proxmox UI, iDRAC, the job
+runner, SMB, Gateways, all of it. There is no per-host carve-out and nothing needs a static
+address or a DHCP reservation.
 
 ACLs are applied **inbound on each VLAN interface**, i.e. to traffic *sourced by* that VLAN.
 Higher tiers may initiate downward freely; lower tiers get explicit permits only. The trick:
-if `clients → mgmt` is denied at VLAN 40's ingress, connections from 40 into 10 never exist, so
-there is never any return traffic to match — VLAN 10's ACL permits everything anyway. Explicit
-`established`/TCP-flag matching is then needed only for the handful of asymmetric permits.
+if `servers → clients` is denied at VLAN 20's ingress, connections from 20 into 40 never exist,
+so there is never any return traffic to match — VLAN 40's ingress permits everything anyway.
+Explicit `established`/TCP-flag matching is then needed only for the handful of asymmetric
+permits.
 
 | From | To | Policy |
 |---|---|---|
 | mgmt (10) | anywhere | permit |
+| clients (40) | anywhere | permit |
+| vpn (98) | anywhere | permit |
 | servers (20) | mgmt (10) | **deny**, except the four permits below |
 | servers (20) | clients (40) | deny except established |
-| clients (40) | mgmt (10) | **deny**, except the admin workstation `10.100.40.99` |
-| clients (40) | servers (20) | permit 443 (Gateways), 445 (SMB); deny the rest |
-| vpn (98) | — | same policy as clients, enforced inbound on Vlan-interface 99 |
 | iot (50) | anything internal | deny |
 | any | internet | permit — OPNsense filters it |
+
+The practical consequence is that **the entire east-west policy is one ACL**, on VLAN 20 — plus
+a second on VLAN 50 if and when IoT separation lands (§4.8). VLAN 10, VLAN 40 and the transit
+interface carry **no packet-filter at all**, because every one of them permits everything.
 
 **The `servers → mgmt` permits.** The cluster genuinely needs four paths upward, and omitting
 them is a silent-failure trap:
@@ -510,48 +519,41 @@ them is a silent-failure trap:
 | `→ 10.100.10.41:9221` | Prometheus/vmagent scraping the PVE exporter (§5.1, §7.5) |
 | `→ 10.100.10.40:443` | Prometheus/vmagent scraping iDRAC Redfish (§5.1, §7.5) |
 
-Worked example for the client VLAN:
+Worked example — the only ACL the design actually needs:
 
 ```
-acl advanced 3040
+acl advanced 3020
  rule 5   permit udp destination-port eq bootps                                    # DHCP relay
- rule 10  permit ip  source 10.100.40.99 0 destination 10.100.10.0 0.0.0.255       # admin PC
- rule 20  deny   ip  destination 10.100.10.0 0.0.0.255
- rule 30  permit tcp destination 10.100.20.0 0.0.0.255 destination-port eq 443
- rule 40  permit tcp destination 10.100.20.0 0.0.0.255 destination-port eq 445
- rule 50  deny   ip  destination 10.100.20.0 0.0.0.255
+ rule 10  permit tcp destination 10.100.10.41 0 destination-port eq 8006           # Proxmox API
+ rule 20  permit udp destination 10.100.10.10 0 destination-port eq dns            # PowerDNS
+ rule 21  permit tcp destination 10.100.10.10 0 destination-port eq dns
+ rule 22  permit tcp destination 10.100.10.10 0 destination-port eq 8081           # PowerDNS API
+ rule 30  permit tcp destination 10.100.10.41 0 destination-port eq 9221           # PVE exporter
+ rule 40  permit tcp destination 10.100.10.40 0 destination-port eq 443            # iDRAC Redfish
+ rule 50  deny   ip  destination 10.100.10.0 0.0.0.255
+ rule 60  permit tcp destination 10.100.40.0 0.0.0.255 established                 # replies to clients
+ rule 70  deny   ip  destination 10.100.40.0 0.0.0.255
  rule 100 permit ip                                                                # internet
-interface Vlan-interface 40
- packet-filter 3040 inbound
+interface Vlan-interface 20
+ packet-filter 3020 inbound
 ```
 
-And the VPN equivalent. Note it must match **on source**, because everything returning from the
-internet for every internal host also arrives inbound on Vlan-interface 99 and must pass:
+Four things that are easy to get wrong:
 
-```
-acl advanced 3099
- rule 10  permit ip  source 10.100.98.99 0 destination 10.100.10.0 0.0.0.255       # admin over VPN
- rule 20  deny   ip  source 10.100.98.0 0.0.0.255 destination 10.100.10.0 0.0.0.255
- rule 30  permit tcp source 10.100.98.0 0.0.0.255 destination 10.100.20.0 0.0.0.255 destination-port eq 443
- rule 40  permit tcp source 10.100.98.0 0.0.0.255 destination 10.100.20.0 0.0.0.255 destination-port eq 445
- rule 50  deny   ip  source 10.100.98.0 0.0.0.255 destination 10.100.20.0 0.0.0.255
- rule 100 permit ip                                                                # all other traffic
-interface Vlan-interface 99
- packet-filter 3099 inbound
-```
-
-Five things that are easy to get wrong:
-
-1. **Rule 5 in ACL 3040 is not optional.** DHCP relay (§4.6) breaks without it, and the
-   symptom — clients getting no address — looks nothing like an ACL problem.
-2. **Rule 10 is the one you depend on daily.** The hierarchy otherwise forbids your PC from
-   reaching the Proxmox UI, iDRAC and the job runner. Give the workstation a static reservation.
-3. **ACL 3099's final `permit ip` is load-bearing.** Without it you drop all inbound internet
-   return traffic for the entire estate.
+1. **Rule 5 is not optional.** DHCP relay (§4.6) breaks without it, and the symptom — VMs
+   getting no address — looks nothing like an ACL problem. It belongs in every ACL on a VLAN
+   with `dhcp: true`.
+2. **Rule 60 covers TCP return traffic only.** A stateless ACL cannot infer UDP flows, so a
+   UDP service on VLAN 20 that a client consumes — HTTP/3 on a Gateway is the realistic one —
+   needs an explicit `permit udp … source-port eq <port>` alongside it, or it will fail in the
+   confusing way where TCP works and QUIC silently doesn't.
+3. **Do not put an ACL on the transit interface.** All inbound internet return traffic for the
+   entire estate arrives on Vlan-interface 99; anything short of `permit ip` there breaks the
+   whole house. The trusted-client policy means it needs no ACL, which removes the trap
+   entirely — leave it alone.
 4. **End every ACL with an explicit `permit ip`** rather than relying on Comware's implicit
-   default action for unmatched packets.
-5. **Configure the management VLAN's ACL last, from the serial console.** Generate rule numbers
-   with gaps (10, 20, 30…) so inserting a rule later does not renumber everything below it.
+   default action for unmatched packets, and generate rule numbers with gaps (10, 20, 30…) so
+   inserting a rule later does not renumber everything below it.
 
 The 5130's ACL capacity is TCAM-bound; a policy of this size is comfortably within it, but do
 not plan on thousands of rules.
@@ -590,10 +592,11 @@ The failure mode is good: if the Proxmox host is down, the internal zone goes wi
 every name in that zone resolves to cluster Gateways that are also down. General internet DNS
 never breaks.
 
-**VPN: WireGuard on OPNsense**, tunnel subnet `10.100.98.0/24`, reaching the internal Gateway
-and (for the admin peer only) the mgmt VLAN. Peers get fixed addresses so the §4.5 ACL can
-distinguish the admin peer from the rest. OPNsense already knows the tunnel subnet directly;
-the switch reaches it via the default static route, so no extra routing is needed.
+**VPN: WireGuard on OPNsense**, tunnel subnet `10.100.98.0/24`. The tunnel is a trusted tier
+(§4.5), so every peer reaches mgmt, servers and iot exactly as a client on VLAN 40 does — no
+peer needs a fixed address and the switch needs no per-peer rules. OPNsense already knows the
+tunnel subnet directly; the switch reaches it via the default static route, so no extra routing
+is needed.
 
 ### 4.7 Codifying stage 0 — one source of truth
 
@@ -622,12 +625,12 @@ vlans:
   - { id: 99, name: transit, subnet: 10.100.99.0/30, svi: .2, dhcp: false }
 vpn:
   subnet: 10.100.98.0/24
-  admin_peer: 10.100.98.99
 policy:
-  - { from: clients, to: mgmt,    action: deny, except: [10.100.40.99] }
-  - { from: clients, to: servers, ports: [443, 445] }
-  - { from: vpn,     to: mgmt,    action: deny, except: [10.100.98.99] }
-  - { from: vpn,     to: servers, ports: [443, 445] }
+  # trusted tiers — these render no ACL at all (§4.5)
+  - { from: mgmt,    to: any, action: permit }
+  - { from: clients, to: any, action: permit }
+  - { from: vpn,     to: any, action: permit }
+  - { from: servers, to: clients, action: deny, allow_established: true }
   - { from: servers, to: mgmt,    action: deny,
       except_dst: ["10.100.10.41:8006", "10.100.10.10:53", "10.100.10.10:8081",
                    "10.100.10.41:9221", "10.100.10.40:443"] }
@@ -683,8 +686,9 @@ own management address, so a bad VLAN 10 change removes every remote path simult
 Serial to the 5130 and physical console on OPNsense are the only true fallbacks.
 
 **Deferred — IoT/guest separation (VLAN 50).** The wireless APs hang off the unmanaged
-living-room switch, so **every phone and smart plug is in VLAN 40 alongside the workstation**.
-That is accepted for now. When it matters, in increasing cost:
+living-room switch, so **every phone and smart plug is in VLAN 40 alongside the workstation** —
+and VLAN 40 is a trusted tier (§4.5), so they inherit unfiltered reach into mgmt and servers.
+That is accepted for now, and it is the main reason to do this eventually. In increasing cost:
 
 1. **Run a second cable** from the 5130 to the living room as an access port in VLAN 50.
 2. **Replace the living-room switch** with a managed one and make the uplink a trunk.
@@ -703,9 +707,11 @@ of them to the switch; note that this raises aggregate throughput, not per-flow.
 - [ ] A client in VLAN 40 gets an address via relay and reaches the internet
 - [ ] The PC (VLAN 40) sustains ≥ 5 Gbit/s to a VM in VLAN 20 — proving the traffic is switched,
       not routed through OPNsense
-- [ ] The trust hierarchy holds: an unprivileged VLAN 40 host cannot reach `10.100.10.0/24`,
-      and the admin workstation can
-- [ ] A WireGuard peer connects and lands in the `clients` tier; the admin peer reaches mgmt
+- [ ] Any DHCP-addressed VLAN 40 host reaches the Proxmox UI, iDRAC and the job runner, with
+      no per-host exception and no static address anywhere
+- [ ] The hierarchy holds downward: a VLAN 20 host cannot reach `10.100.10.0/24` outside the
+      four `servers → mgmt` permits, and cannot initiate to VLAN 40
+- [ ] A WireGuard peer connects and has the same reach as a host on VLAN 40
 - [ ] Serial console access to the 5130 is tested and documented
 - [ ] A deliberately broken config is rolled back by the SAFETY-NET job without intervention
 
@@ -1197,10 +1203,10 @@ bootstrap dependency.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| **Stage 0 change locks you out of the switch** | Total loss of remote access — VLAN 10 carries iDRAC, the Proxmox host *and* the switch's own management IP, so every remote path dies together | Arm the SAFETY-NET scheduled reboot before every apply (§4.8); configure the mgmt VLAN's ACL last; keep a tested USB-serial console; never run stage 0 from the `runner` LXC |
+| **Stage 0 change locks you out of the switch** | Total loss of remote access — VLAN 10 carries iDRAC, the Proxmox host *and* the switch's own management IP, so every remote path dies together | Arm the SAFETY-NET scheduled reboot before every apply (§4.8); apply VLAN 10 changes last; keep a tested USB-serial console; never run stage 0 from the `runner` LXC |
 | Missing `servers → mgmt` ACL permits | `external-dns` silently can't write records; monitoring silently loses the PVE and iDRAC targets | The four permits are enumerated in §4.5 and generated from `network.yml`; assert them in `verify.yml` |
-| No stateful inspection or IDS between VLANs | East-west traffic is filtered only by stateless ACLs; a compromised client can probe permitted ports freely | Accepted — the 10 Gb requirement rules out router-on-a-stick (§4.1). The trust hierarchy keeps the permit list small (§4.5) |
-| Wireless behind the unmanaged switch | Every phone and smart plug shares VLAN 40 with the workstation | Accepted for now; §4.8 option 3 (APs on the 5130) is the exit, and is cheapest if cable is being run anyway |
+| No stateful inspection or IDS between VLANs | East-west traffic is filtered only by stateless ACLs; a compromised client has unfiltered reach into mgmt and servers, since VLAN 40 is a trusted tier (§4.5) | Accepted — the 10 Gb requirement rules out router-on-a-stick (§4.1), and trusting the client VLAN is a deliberate choice for usability. The blast radius shrinks once IoT/guest devices leave VLAN 40 (§4.8) |
+| Wireless behind the unmanaged switch | Every phone and smart plug shares the trusted VLAN 40 with the workstation, so an untrusted device reaches mgmt unfiltered | Accepted for now; §4.8 option 3 (APs on the 5130) is the exit, and is cheapest if cable is being run anyway |
 | OPNsense outbound NAT / static route missing after a rebuild | Every VLAN silently has no internet; looks like a switch fault | Both are in `stage0-network` and asserted by `verify.yml` (§4.4, §4.7) |
 | **ZFS pool fills up** | Writes fail cluster-wide; severe performance degradation past 80% | The main capacity risk on this hardware. Alert at 75%; cap metrics/Loki retention; conservative autoscaler `max-size`; add disks via `zpool attach` (§2.5) |
 | 8K `volblocksize` left in place on RAID-Z1 | ~166% space usage — hundreds of GB wasted | Verify and set ≥16K in stage 1 (§5.1); migrate any existing volumes |
