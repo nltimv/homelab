@@ -1,7 +1,7 @@
 # Homelab GitOps Automation — Plan
 
 > **Status: all decisions made** (§9). Phase 0 can begin.
-> Last updated: 2026-08-19.
+> Last updated: 2026-08-20.
 
 ---
 
@@ -13,19 +13,20 @@ stages that each have a clear boundary and a clear "break glass" story.
 | Stage | Owns | Driven by | Lives where |
 |---|---|---|---|
 | **0 — Network** | VLANs, inter-VLAN routing and ACLs, DHCP/resolver, the router↔switch boundary | Ansible, run from a workstation, **manually triggered** | OPNsense + HPE 5130 |
-| **1 — Bootstrap** | Proxmox host config, internal DNS, secrets root, job-runner UI, management cluster | Ansible, run from a workstation | Proxmox host + LXCs + 1 VM |
-| **2 — Cluster lifecycle** | Creating/upgrading/repairing the workload Kubernetes cluster | GitOps (Flux on the management cluster) | Management cluster |
+| **1 — Bootstrap** | Proxmox host config, internal DNS, secrets root, job-runner UI | Ansible, run from a workstation | Proxmox host + 3 LXCs |
+| **2 — Cluster lifecycle** | Creating/upgrading/repairing the workload Kubernetes cluster | OpenTofu + talhelper + `talosctl`, triggered from the `runner` LXC | `runner` LXC |
 | **3 — Platform & apps** | Ingress, certs, storage classes, monitoring, Postgres, apps | GitOps (Flux on the workload cluster) | Workload cluster |
 
 ### Design principles
 
 1. **Each stage can rebuild the one above it.** Stage 1 survives the total loss of the
-   Kubernetes clusters and can recreate them; stage 0 survives the loss of everything else.
+   Kubernetes cluster and can recreate it; stage 0 survives the loss of everything else.
    This is the single most important property and it drives the placement decisions below.
-2. **Stages 0 and 1 are not GitOps.** They are the chicken-and-egg layers, so they are plain
-   idempotent Ansible run from a laptop. They are still fully in Git. Stage 0 goes further and
-   is **never** reconciled automatically: a controller that manages the network it depends on
-   cannot roll back its own mistakes (§4).
+2. **Only stage 3 is continuously reconciled.** Stages 0–2 are the chicken-and-egg layers:
+   fully described in Git, but *applied when triggered*, not by a controller watching a branch.
+   Stage 0 goes further and is **never** reconciled automatically, because a controller that
+   manages the network it depends on cannot roll back its own mistakes (§4). Stage 2 is
+   triggered from the `runner` LXC (§6), which is deliberately outside the cluster it builds.
 3. **Declarative over imperative wherever a controller exists.** Upgrades should be a
    version bump in a YAML file, not a runbook.
 4. **Assume the host dies.** Nothing here provides hardware fault tolerance, so off-box
@@ -89,8 +90,10 @@ Consequences, in order of importance:
   PostgreSQL are relentlessly sync-write heavy, so that would be the worst placement available
   despite the drives being nominally the fastest. It is also LVM, not ZFS: no checksums, no
   snapshots, no `send`/`recv`. **Use it only for regenerable data** (§2.3).
-- **Autoscaling is bounded by SSD-tier disk, not RAM.** Each burst node needs a root disk. With
-  512 GB RAM the autoscaler will never run out of memory; it can absolutely fill `ssdpool`. §6.4.
+- **Node count is bounded by SSD-tier disk, not RAM.** Every node needs a root disk out of a
+  1.44 TB working budget that also holds every PVC. With 512 GB you will never run out of
+  memory; you can absolutely fill `ssdpool`. This is why the node pools are a fixed, budgeted
+  size (§2.6, §6.6) rather than something that grows on demand.
 - **Keep every pool under ~80% full.** ZFS performance and fragmentation degrade badly past
   that, so working budgets are **~1.44 TB** (SSD) and **~4.32 TB** (HDD).
 - **Dual-socket NUMA.** Large VMs should either fit within one NUMA node or have NUMA topology
@@ -206,12 +209,15 @@ Talos keeps node disks small, which helps considerably on the SSD tier.
 | Item | Count | Each | Total |
 |---|---|---|---|
 | Stage 1 LXCs (`netcore`, `runner`, `nas`) | 3 | 10 GB | 30 GB |
-| Management cluster VM | 1 | 40 GB | 40 GB |
 | Control plane (Talos) | 3 | 20 GB | 60 GB |
-| System pool workers | 3 | 40 GB | 120 GB |
-| Burst pool workers (at max) | 0–6 | 20 GB | up to 120 GB |
-| **VM subtotal** | | | **~370 GB** |
-| **Remaining for hot RWO PVs (`proxmox-ssd`)** | | | **~1.07 TB** |
+| Workers (Talos) | 3 | 60 GB | 180 GB |
+| **VM subtotal** | | | **~270 GB** |
+| **Remaining for hot RWO PVs (`proxmox-ssd`)** | | | **~1.17 TB** |
+
+Workers get 60 GB rather than the 40 GB an autoscaled design would have used: with one fixed
+pool carrying everything there is no burst pool to reserve headroom for, so the budget is
+better spent on generous per-node ephemeral storage (image cache, `emptyDir`, container logs)
+than left unallocated.
 
 **`hddpool` — ~5.4 TB usable, ~4.32 TB working budget (80%)**
 
@@ -226,10 +232,10 @@ Replication multipliers decide D7 on the **SSD tier**, where headroom is finite:
 
 | Storage choice | Multiplier | Usable hot application data |
 |---|---|---|
-| **Proxmox CSI** (ZFS-backed, no extra replication) | 1× | **~1.07 TB** |
-| Longhorn, 2 replicas | 2× | ~535 GB |
-| Longhorn, 3 replicas (default) | 3× | ~357 GB |
-| Rook-Ceph, 3× replication | 3× | ~357 GB, *and* Ceph OSDs on zvols means CoW-on-CoW |
+| **Proxmox CSI** (ZFS-backed, no extra replication) | 1× | **~1.17 TB** |
+| Longhorn, 2 replicas | 2× | ~585 GB |
+| Longhorn, 3 replicas (default) | 3× | ~390 GB |
+| Rook-Ceph, 3× replication | 3× | ~390 GB, *and* Ceph OSDs on zvols means CoW-on-CoW |
 
 RAM was never going to decide this. Disk does, and decisively.
 
@@ -264,42 +270,31 @@ atomic) remains available as a further knob if this ever needs revisiting.
 │                  ssdpool  1.8 TB  → VM disks, hot PVs               │
 │                  hddpool  5.4 TB  → NAS, bulk PVs, PBS local        │
 │                                                                     │
-│  ── STAGE 1 ─────────────────────────────────────────────────────   │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                 │
-│  │ LXC: netcore │ │ LXC: runner  │ │ LXC: nas     │                 │
-│  │ authoritative│ │ web UI, runs │ │ SMB + NFS on │                 │
-│  │ internal DNS │ │ Ansible /    │ │ hddpool/nas  │                 │
-│  │ zone (v10)   │ │ OpenTofu(v10)│ │  (VLAN 20)   │                 │
-│  └──────────────┘ └──────────────┘ └──────┬───────┘                 │
-│  ┌────────────────────────┐               │                         │
-│  │ VM: mgmt cluster (v10) │               │ NFS → nfs-nas (RWX)     │
-│  │ single-node k8s + Flux │               │                         │
-│  └───────────┬────────────┘               │                         │
-│              │                            │                         │
-│  ── STAGE 2 (GitOps, reconciled by mgmt Flux) ────────────────────  │
-│   Cluster API + Proxmox provider + IPAM   │                         │
-│   cluster-autoscaler                      │  creates / upgrades     │
-│   maintenance jobs (certs, image builds)  │  / repairs              │
-│              ▼                            │                         │
-│  ┌───────────────────────────────────────────────────────────┐      │
-│  │ Workload Kubernetes cluster (VMs, VLAN 20)  ◄──┘          │      │
-│  │  control plane ×3  │ system pool (fixed) │ burst pool     │      │
-│  │                    │ storage, DBs        │ (autoscaled)   │      │
-│  │  ── STAGE 3 (GitOps, reconciled by workload Flux) ─────── │      │
-│  │  Cilium · CSI (ssd/hdd) · Gateway ×2 · cert-manager       │      │
-│  │  external-dns · monitoring · CloudNativePG · Nextcloud    │      │
-│  └───────────────────────────────────────────────────────────┘      │
+│  ── STAGE 1 ─────────────────────────────────────────────────────── │
+│  ┌──────────────┐ ┌─────────────────────┐ ┌──────────────┐          │
+│  │ LXC: netcore │ │ LXC: runner  (v10)  │ │ LXC: nas     │          │
+│  │ authoritative│ │ Semaphore UI, runs  │ │ SMB + NFS on │          │
+│  │ internal DNS │ │ Ansible, OpenTofu,  │ │ hddpool/nas  │          │
+│  │ zone  (v10)  │ │ talhelper, talosctl │ │  (VLAN 20)   │          │
+│  └──────────────┘ └──────────┬──────────┘ └──────┬───────┘          │
+│                              │                   │                  │
+│  ── STAGE 2 (Git-defined, triggered from Semaphore) ─────────────── │
+│   OpenTofu  → Proxmox VMs (disks, NIC, VLAN tag)  │                 │
+│   talhelper → Talos machine configs, one file     │ NFS → nfs-nas   │
+│   talosctl  → apply · bootstrap · upgrade         │       (RWX)     │
+│                              ▼                    │                 │
+│  ┌────────────────────────────────────────────┐   │                 │
+│  │ Workload Kubernetes cluster (VMs, VLAN 20) │◄──┘                 │
+│  │  control plane ×3 (Talos VIP) │ workers ×3 │                     │
+│  │  ── STAGE 3 (GitOps, workload Flux) ────── │                     │
+│  │  Cilium · CSI (ssd/hdd) · Gateway ×2       │                     │
+│  │  cert-manager · external-dns · monitoring  │                     │
+│  │  CloudNativePG · Nextcloud                 │                     │
+│  └────────────────────────────────────────────┘                     │
 └─────────────────────────────────────────────────────────────────────┘
         │ PBS local datastore (hddpool) ──sync──► Backblaze B2
         │ CNPG / Velero / restic ─────────────► Backblaze B2
 ```
-
-### Why a separate management cluster
-
-Cluster API needs somewhere to run that is **not** the cluster it manages. A small single-node
-cluster created by stage 1 gives stage 2 a natural home, makes "stage 2 is GitOps" true rather
-than aspirational, and means a totally destroyed workload cluster can be rebuilt by a
-controller that is still running rather than by a human with a runbook. → D3.
 
 ---
 
@@ -313,8 +308,8 @@ over this network, so the network cannot be one of the things stage 1 configures
 
 > **Stage 0 is never GitOps.** A reconciler that manages the network it depends on is a
 > circular dependency with an unrecoverable failure mode: push a bad ACL, lose contact with
-> the switch, and the controller that would roll it back can no longer reach it. Cluster API
-> rebuilding a VM is recoverable; Flux bricking the default gateway is not.
+> the switch, and the controller that would roll it back can no longer reach it. A job that
+> rebuilds a VM is recoverable; Flux bricking the default gateway is not.
 >
 > For the same reason, **stage 0 must not run from the `runner` LXC** (§5.3) — the runner sits
 > behind the switch it would be reconfiguring, on a host whose management VLAN it might be
@@ -389,7 +384,7 @@ it — nothing is built on top of them yet.
 | VLAN | Subnet | Switch SVI | Holds |
 |---|---|---|---|
 | 1 | — | *none* | **Quarantine.** No SVI, no route. All unused ports park here. |
-| 10 | `10.100.10.0/24` | `.10.2` (gateway) | Infra: switch `.2`, `netcore` `.10`, `runner` `.11`, mgmt cluster VM `.20`, iDRAC `.40`, PVE host `.41` |
+| 10 | `10.100.10.0/24` | `.10.2` (gateway) | Infra: switch `.2`, `netcore` `.10`, `runner` `.11`, iDRAC `.40`, PVE host `.41` |
 | 20 | `10.100.20.0/24` | `.20.2` (gateway) | Server workloads: Kubernetes nodes, `nas` LXC, **LB VIPs `.200–.250`** |
 | 40 | `10.100.40.0/24` | `.40.2` (gateway) | Clients: PC, laptops, phones, TV, APs — everything behind the living-room switch. All DHCP, no reservations |
 | 50 | `10.100.50.0/24` | `.50.2` (gateway) | IoT / guest — **deferred**, see §4.8 |
@@ -403,6 +398,18 @@ Two notes on what is deliberately *absent*:
   NIC on every Kubernetes node for no benefit. The VIP range is carved out of VLAN 20. → D10.
 - **No storage/replication VLAN.** With Proxmox CSI and a NAS LXC on the same host (D7), there
   is no storage replication traffic to isolate.
+
+Within VLAN 20, addresses are hand-allocated because Talos node addresses are written
+statically into `talconfig.yaml` (§6.1) rather than handed out by a controller:
+
+| Range | Holds |
+|---|---|
+| `.20.10` | Talos control-plane VIP (D10) |
+| `.20.11–.20.13` | Control-plane nodes |
+| `.20.21–.20.23` | Worker nodes |
+| `.20.30` | `nas` LXC |
+| `.20.200–.20.250` | Cilium LB-IPAM pool |
+| `.20.100–.20.199` | DHCP pool — first boot of a node before its config is applied, and anything transient |
 
 The `nas` LXC lives in VLAN 20, not VLAN 10, even though it is a stage 1 component: it is a
 service consumed by clients (SMB) and by the cluster (NFS), so it belongs with the server
@@ -576,8 +583,9 @@ later `.50.0/24`) as subnets with no interface binding. Two reasons this beats m
 1. **Household DHCP must not live on the machine this project exists to rebuild.** OPNsense is
    the most always-on box in the house; the Proxmox host will be torn down and re-provisioned
    repeatedly.
-2. Kubernetes node addresses come from Cluster API's IPAM provider anyway (§6.1), so DHCP only
-   serves first boot/PXE and household devices — low value, high blast radius.
+2. Kubernetes node addresses are static, written into `talconfig.yaml` (§4.2, §6.1), so DHCP
+   only serves a node's very first boot — before its machine config is applied — plus
+   household devices. Low value, high blast radius.
 
 **DNS: this is `netcore`'s actual job.** The real requirement was never DHCP; it is that stage
 3's `external-dns` must *write* records into an internal zone, and OPNsense's Unbound has no
@@ -620,7 +628,8 @@ stage0-network/
 vlans:
   - { id: 10, name: mgmt,    subnet: 10.100.10.0/24, svi: .2, dhcp: false }
   - { id: 20, name: servers, subnet: 10.100.20.0/24, svi: .2, dhcp: true,
-      lb_pool: 10.100.20.200-10.100.20.250 }
+      dhcp_pool: 10.100.20.100-10.100.20.199,      # first boot only — nodes are static
+      lb_pool:   10.100.20.200-10.100.20.250 }
   - { id: 40, name: clients, subnet: 10.100.40.0/24, svi: .2, dhcp: true }
   - { id: 99, name: transit, subnet: 10.100.99.0/30, svi: .2, dhcp: false }
 vpn:
@@ -636,7 +645,8 @@ policy:
                    "10.100.10.41:9221", "10.100.10.40:443"] }
 ```
 
-Stage 1 reads the same file for `bridge-vids`; stage 3 generates its
+Stage 1 reads the same file for `bridge-vids`; stage 2's `talconfig.yaml` node addresses must
+sit outside `dhcp_pool` and outside `lb_pool`; stage 3 generates its
 `CiliumLoadBalancerIPPool` from `lb_pool`.
 
 **OPNsense.** Split it: **bootstrap** (interface assignment, LAN IP, enabling the API) is a
@@ -744,7 +754,8 @@ of them to the switch; note that this raises aggregate throughput, not per-flow.
 - **iDRAC:** configure out-of-band management and the Redfish exporter, so hardware health
   (PSU, fans, drive SMART, temperatures) lands in the stage 3 monitoring stack
 - **PVE exporter** on `:9221` for the same reason
-- API token + role for stage 2's Proxmox provider (least privilege, not `root@pam`)
+- API token + role for stage 2's OpenTofu (`bpg/proxmox`) and for Proxmox CSI — least
+  privilege, not `root@pam`, and separate tokens so the cluster's credential cannot create VMs
 - **Proxmox Backup Server** — local datastore on `hddpool` plus an **S3 datastore on Backblaze
   B2** and a sync job between them, client-side encryption on, chunk cache on the boot NVMe (§7.7)
 
@@ -761,8 +772,18 @@ general name resolution off the machine this project exists to rebuild repeatedl
 
 ### 5.3 `runner` LXC — web UI and job execution
 `10.100.10.11`. **Semaphore UI** (D5): the "run stage 2 from a GUI" requirement and the
-break-glass console. Outside Kubernetes so it still works when Kubernetes doesn't. Runs Ansible
-and OpenTofu jobs against Proxmox and the management cluster. It must **not** run stage 0 (§4).
+break-glass console. Outside Kubernetes so it still works when Kubernetes doesn't.
+
+With D2 changed to talhelper, this LXC is **where stage 2 lives** (§6) rather than a
+convenience — it is the only thing that can rebuild the cluster, so stage 1 must install and
+pin the toolchain rather than leaving it to whatever is on a laptop:
+
+- `tofu` + the `bpg/proxmox` provider, with a provider mirror or lockfile committed
+- `talhelper`, `talosctl`, `kubectl`, `flux`, `sops`, `age` — versions pinned in Ansible
+- The age private key (§5.5), so `talhelper genconfig` can decrypt `talsecret.sops.yaml`
+- Checkouts of both repos (§8.1), and the OpenTofu state backend
+
+It must **not** run stage 0 (§4): it sits behind the switch it would be reconfiguring.
 
 ### 5.4 `nas` LXC — SMB + NFS file services
 VLAN 20. Bind-mounts `hddpool/nas` and exports it two ways (§2.3):
@@ -775,14 +796,16 @@ same files. Users, shares and exports are defined in Ansible. Snapshots come fro
 host; backup is restic/rclone to B2 (§7.7). This is greenfield — there is no existing NAS data
 to import.
 
-### 5.5 Management cluster VM + Flux bootstrap
-`10.100.10.20`. Single-node Kubernetes, created by Ansible, with `flux bootstrap` pointed at
-this repo's `stage2/` path. From this moment on, stage 2 is Git-driven. → D2, D3.
+### 5.5 Secrets root
+Stage 1 generates the **age** keypair and places the private key in the two places that need
+it:
 
-### 5.6 Secrets root
-Stage 1 generates the **age** keypair and installs the private key as a Kubernetes Secret in
-both Flux instances (`sops-age` in `flux-system`), so Flux can decrypt at reconcile time. It
-also configures the private secrets repo as a second `GitRepository` source (§8.1).
+- on the `runner` LXC, so `talhelper genconfig` can decrypt `talsecret.sops.yaml` (§6.1)
+- later, as the `sops-age` Secret in `flux-system` on the workload cluster, so Flux can decrypt
+  at reconcile time — installed during the stage 2 bootstrap (§6.2), since the cluster does not
+  exist yet at this point
+
+It also configures the private secrets repo as a second `GitRepository` source (§8.1).
 
 The private key is the one thing that **cannot** live in any repo — password manager plus an
 offline copy. Losing it means every encrypted value in Git is unrecoverable; leaking it means
@@ -794,90 +817,162 @@ every encrypted value ever committed is exposed. Back it up before you rely on i
 - [ ] The internal DNS zone resolves, and a test dynamic update succeeds
 - [ ] `vmbr0` is VLAN-aware and a VM tagged `20` gets an address via relay
 - [ ] Semaphore is reachable and able to run a trivial job
-- [ ] Management cluster is up and Flux reports the `stage2/` path as reconciled
+- [ ] `tofu`, `talhelper`, `talosctl`, `flux` and `sops` are installed and version-pinned on the
+      runner, and `talhelper genconfig` renders configs from an encrypted secret file
 - [ ] Secrets root is provisioned and backed up off-box
 
 ---
 
 ## 6. Stage 2 — Cluster lifecycle
 
-Everything here is YAML in `stage2/`, reconciled by the management cluster's Flux.
+Everything here is declarative source in `stage2-cluster/`, applied by **jobs on the `runner`
+LXC** (Semaphore, D5). Unlike stages 0 and 1 it is not "run from a laptop"; unlike stage 3 it is
+not continuously reconciled either. It is **Git-defined, triggered on demand or on a schedule**.
 
-### 6.1 Components
-- **cert-manager** (a Cluster API prerequisite, for webhook certs)
-- **Cluster API core** + Talos bootstrap and control-plane providers + **Proxmox infrastructure
-  provider (CAPMOX)** + **in-cluster IPAM provider** → D1, D2
-- **ClusterClass + Cluster topology.** With a ClusterClass, a Kubernetes upgrade is
-  `spec.topology.version: v1.34.x` in one file and the controllers roll control plane and
-  workers in the right order. This is what makes "upgrades as GitOps" real rather than a pile
-  of scripts.
-- **cluster-autoscaler** (`--cloud-provider=clusterapi`) → §6.4
-- **Node images** — with Talos, import the published `nocloud` image per release. No Packer
-  pipeline, which was a large part of choosing D1=A.
-- **Maintenance automation** — cron- and manually-triggerable jobs → §6.5
+### 6.1 Three tools, and the line between them
 
-### 6.2 Certificate rotation
-Solved by the controllers, not by scripts. Talos manages its own PKI and rotates most material
-itself; the Talos control-plane provider handles the rest on machine rollout. The correct answer
-is always "roll the machine", never "run a rotation script on a live node". Add a monitoring
-alert on certificate expiry as a backstop.
-
-### 6.3 Storage side-infrastructure
-Nothing to do here. Under D7 the storage layer is host-side ZFS (created by stage 1) plus the
-Proxmox CSI *driver*, which is a cluster addon and therefore stage 3's (§7.1).
-
-### 6.4 Autoscaling — and the single-host trap
-
-`cluster-autoscaler` watches for unschedulable pods and scales the `MachineDeployment`
-replica count; Cluster API then creates VMs. Scale-from-zero needs capacity annotations
-because the Proxmox provider doesn't advertise machine capacity:
-
-```yaml
-metadata:
-  annotations:
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "6"
-    capacity.cluster-autoscaler.kubernetes.io/memory: "16G"
-    capacity.cluster-autoscaler.kubernetes.io/cpu: "4"
-    capacity.cluster-autoscaler.kubernetes.io/ephemeral-disk: "20Gi"
-```
-
-**Three traps specific to this setup:**
-
-1. **The autoscaler has no idea the Proxmox host is finite — and here the limit is disk, not
-   RAM.** With 512 GB you will never exhaust memory, but `max-size × root disk size` comes
-   straight out of a 1.44 TB working budget that also holds every PVC. `max-size: 6` matches
-   the §2.6 budget. Alert on pool usage crossing 75%. Also **disable memory ballooning** on
-   Kubernetes node VMs — ballooning plus kubelet's view of available memory is a bad
-   combination, and with this much RAM there is no reason to overcommit.
-2. **Replicated node-local storage blocks scale-down.** Longhorn and Ceph place replicas on
-   nodes; the autoscaler then refuses to drain those nodes (or worse, drains them and degrades
-   your volumes). Avoided outright by D7 — Proxmox CSI volumes detach and reattach freely, and
-   NFS is node-agnostic.
-3. **Scale-down needs discipline elsewhere:** PodDisruptionBudgets on anything that matters,
-   and `cluster-autoscaler.kubernetes.io/safe-to-evict` annotations on pods with local storage
-   that are actually safe to move.
-
-**Split node pools** handle trap 3 cleanly:
-
-| Pool | Autoscaled | Runs |
+| Tool | Owns | Source of truth |
 |---|---|---|
-| `control-plane` ×3 | no | control plane only |
-| `system` (fixed, 3 nodes) | no | Postgres, monitoring, Gateways — anything stateful or with a PDB |
-| `burst` (0 → 6) | **yes** | stateless workloads only, via taint + toleration or nodeSelector |
+| **OpenTofu** + `bpg/proxmox` | The VMs: CPU, RAM, disks, NIC and VLAN tag, boot media | `stage2-cluster/tofu/` |
+| **talhelper** | Talos machine configuration for every node, rendered from one file | `stage2-cluster/talconfig.yaml` |
+| **`talosctl`** | Applying configs, bootstrapping etcd, upgrading Talos and Kubernetes | — |
 
-The burst pool holds no persistent state, so it can be destroyed freely.
+`talhelper genconfig` renders `talconfig.yaml` plus an encrypted `talsecret.sops.yaml` into
+per-node machine configs. That render is pure: the outputs are reproducible from the two inputs,
+so **only the inputs are committed**, and the secret one lives in the private repo (§8.1) under
+the same age key as everything else. `talhelper validate` gives a schema check in CI, and
+`talhelper gencommand` emits the exact `talosctl` invocations, which is what the Semaphore jobs
+wrap.
 
-### 6.5 Maintenance tasks (cron + manual trigger)
-Kubernetes/Talos version upgrades, node image refreshes, etcd backup verification, certificate
-expiry checks, ZFS scrubs, Proxmox host updates, backup restore drills (§7.7). Each should be a
-job that is idempotent, logs to one place, and can be triggered both on a schedule and by a
-human clicking a button in Semaphore (D6).
+Node addressing is **static, written directly in `talconfig.yaml`** (§4.2). There is no IPAM
+controller and no DHCP reservation to keep in sync — DHCP serves only a node's first boot,
+before any config is applied.
+
+### 6.2 The bootstrap sequence
+
+Each step is a Semaphore job; the whole chain is one job that runs them in order.
+
+1. **`tofu apply`** — creates 3 control-plane and 3 worker VMs on `ssdpool`, NIC tagged VLAN 20,
+   booting the Talos image (§6.3). Memory ballooning **off** on every node VM: ballooning versus
+   kubelet's view of available memory is a bad combination, and with 512 GB there is no reason
+   to overcommit.
+2. **`talhelper genconfig`** — renders machine configs into a gitignored `clusterconfig/`.
+3. **`talosctl apply-config --insecure`** to each node at its maintenance-mode address.
+4. **`talosctl bootstrap`** against one control-plane node — starts etcd. Exactly once, ever.
+5. **`talosctl kubeconfig`** — the cluster is now reachable at the Talos VIP `10.100.20.10`.
+6. **Cilium** comes up with the cluster, not after it. Talos is configured `cni: none` with
+   `kube-proxy` disabled, and the rendered Cilium manifests are embedded as talhelper
+   `inlineManifests`, so the cluster never sits in a NotReady state waiting for a human to run
+   `helm install`. Cilium's `k8sServiceHost`/`k8sServicePort` point at **KubePrism**
+   (`localhost:7445`), Talos's local API-server proxy — the standard way to give the CNI an API
+   endpoint before there is a service network to provide one.
+7. **`flux bootstrap`** against `stage3-platform/`, and install the `sops-age` Secret (§5.5).
+   From here on, stage 3 is continuously reconciled and stage 2 goes quiet until a version bump.
+
+### 6.3 Node images
+
+Talos on Proxmox needs the **`siderolabs/qemu-guest-agent`** system extension, or Proxmox never
+learns the guest's IP and cannot do a graceful shutdown. Extensions are baked in at image build
+time by the **Image Factory**, which means an image is identified by a *schematic ID* derived
+from the extension list.
+
+talhelper handles this: declare the schematic in `talconfig.yaml` and use
+`talhelper genurl installer` / `genurl iso` to produce the matching URLs. This is the piece that
+made D1 (Talos) attractive in the first place — **no Packer pipeline to own**, because the image
+is a pure function of a few lines of YAML.
+
+Import the `nocloud` image per release into Proxmox as a template or ISO; stage 1 budgets ~40 GB
+on the boot NVMe for exactly this (§2.6).
+
+### 6.4 Upgrades — still a version bump in one file
+
+"Upgrades are a version bump in one file, not a runbook" was a design principle before the
+tooling changed (§1), and it survives the change intact — only the mechanism differs.
+
+| Upgrade | Change | Then |
+|---|---|---|
+| Talos | `talosVersion:` in `talconfig.yaml` | `talhelper genurl installer`, then `talosctl upgrade --nodes <n> --image <url>`, one node at a time |
+| Kubernetes | `kubernetesVersion:` in `talconfig.yaml` | `talosctl upgrade-k8s --to <version>` — Talos rolls the control-plane components itself |
+| Machine config | anything else in `talconfig.yaml` | `talhelper genconfig`, then `talosctl apply-config`; Talos reboots only if the change requires it |
+
+Talos upgrades are A/B: the node boots the new image, and rolls back automatically if it fails
+to come up healthy. Sequence control plane before workers, and let etcd report healthy between
+nodes — the Semaphore job should assert that rather than trusting a `sleep`.
+
+Renovate can raise the version bumps as pull requests against `talconfig.yaml`, which keeps the
+"read the release notes, merge, click Run" loop honest without putting an upgrade controller
+inside the cluster.
+
+### 6.5 Certificate rotation
+
+Talos manages its own PKI and rotates Kubernetes control-plane certificates itself, so the
+correct answer to an expiring certificate is still **roll the machine**, never "run a rotation
+script on a live node".
+
+Two things do not rotate on their own and need to be on the calendar:
+
+- **The `talosconfig` client certificate**, which is what `talosctl` authenticates with. It is
+  regenerated by `talhelper genconfig` from the secrets bundle, so the fix is a re-render, not
+  a rebuild.
+- **The Talos and Kubernetes CAs** in `talsecret.sops.yaml`, which are long-lived.
+  `talosctl rotate-ca` handles both if one is ever suspected compromised.
+
+Add a monitoring alert on certificate expiry as a backstop (§7.5).
+
+### 6.6 Fixed capacity, deliberately
+
+There is **no cluster-autoscaler and no burst pool**. Two fixed pools, sized against the §2.6
+budget:
+
+| Pool | Count | Root disk | Runs |
+|---|---|---|---|
+| `control-plane` | 3 | 20 GB | control plane only |
+| `workers` | 3 | 60 GB | everything else |
+
+Autoscaling is the wrong shape for this hardware. It exists to convert idle capacity into money
+on a cloud bill; here the capacity is a box that is already bought, already powered on, and has
+512 GB of RAM that nothing will exhaust. The binding constraint is **SSD-tier disk** (§2.2), and
+disk is precisely what autoscaling *consumes* — every burst node takes a root disk out of the
+same 1.44 TB budget that holds every PVC, so the ceiling has to be hand-budgeted regardless.
+Paying for that with Cluster API, CAPMOX, an IPAM provider, scale-from-zero capacity
+annotations, a split node-pool taint scheme, and a permanent extra Kubernetes cluster to run the
+controllers in, was a large amount of machinery to arrive back at a number chosen by hand.
+
+Growing the cluster is `count = 4` in OpenTofu plus a node entry in `talconfig.yaml` — a commit
+and one job run.
+
+One consequence worth keeping: with no autoscaler draining nodes, the §2.6 argument against
+replicated node-local storage (Longhorn, Ceph) rests purely on the capacity multiplier now, not
+on scale-down interactions. It is still decisive (D7).
+
+### 6.7 Repair and rebuild
+
+| Situation | Procedure |
+|---|---|
+| A worker is broken | `talosctl reset` it, or destroy and recreate the VM in OpenTofu, re-apply its config. It rejoins; nothing needs draining beyond the usual. |
+| A control-plane node is broken | `talosctl etcd remove-member` first, then recreate. Never re-run `talosctl bootstrap`. |
+| etcd quorum lost | Restore from a Talos etcd snapshot (`talosctl etcd snapshot`, taken on a schedule by §6.8 and backed up per §7.7). |
+| Total cluster loss | Re-run the §6.2 chain end to end. The runner, the two repos and the age key are the only surviving inputs required. |
+
+Because the same job chain builds the cluster the first time and rebuilds it afterwards, the
+rebuild path is exercised every time the cluster is recreated during phases 3–5 — which is the
+main reason the throwaway-cluster phase is in the roadmap at all.
+
+### 6.8 Maintenance tasks (cron + manual trigger)
+
+Talos and Kubernetes version upgrades, node image refreshes, **scheduled `talosctl etcd
+snapshot` with off-box copy**, certificate expiry checks, ZFS scrubs, Proxmox host updates,
+backup restore drills (§7.7). Each should be idempotent, log to one place, and be triggerable
+both on a schedule and by a human clicking a button in Semaphore (D6).
 
 ### Stage 2 exit criteria
-- [ ] Deleting the workload cluster and letting Flux reconcile rebuilds it unattended
-- [ ] A Kubernetes version bump in one file rolls the whole cluster with no manual steps
-- [ ] Autoscaler scales the burst pool up under load and back to zero afterwards
+- [ ] A destroyed cluster is rebuilt end to end by one Semaphore job chain, from Git plus the
+      age key, with no manual `talosctl` invocations
+- [ ] A Talos version bump in `talconfig.yaml` rolls every node without downtime for workloads
+      that have a PDB
+- [ ] A Kubernetes version bump in the same file completes via `talosctl upgrade-k8s`
+- [ ] The cluster comes up with Cilium already running — no post-bootstrap manual CNI install
+- [ ] An etcd snapshot has been taken, copied off-box, and restored into a throwaway cluster
 - [ ] Cert expiry is monitored and rotation is proven by a forced rollout
 
 ---
@@ -888,10 +983,14 @@ Flux on the workload cluster, reconciling `stage3/`.
 
 ### 7.1 The stage 2 / stage 3 boundary
 Explicit rule: **stage 2 owns everything required for the cluster to reach the point where Flux
-can run** — CNI, cloud-controller-manager, and Flux itself, installed via Cluster API's Helm
-add-on provider or a ClusterResourceSet. **Stage 3 owns everything above that line**, including
-CSI drivers and storage classes. Without this rule, CNI ownership in particular ends up
-ambiguous.
+can run** — CNI and Flux itself, installed as talhelper `inlineManifests` during bootstrap
+(§6.2). **Stage 3 owns everything above that line**, including CSI drivers and storage classes.
+Without this rule, CNI ownership in particular ends up ambiguous.
+
+Cilium is the awkward case, because it is installed by stage 2 and then *configured* by stage 3.
+Resolve it the usual way: stage 2 embeds a minimal Cilium sufficient to make nodes Ready, and
+stage 3's `HelmRelease` adopts and owns it from there — same release name and namespace, so the
+first reconcile is an upgrade rather than a conflict.
 
 ### 7.2 Layout
 
@@ -1036,7 +1135,7 @@ effectively free — which removes the usual excuse for never testing one.
 
 #### Restore drills
 
-An untested backup is not a backup. Schedule as stage 2 maintenance jobs (§6.5):
+An untested backup is not a backup. Schedule as stage 2 maintenance jobs (§6.8):
 
 - Quarterly: restore a VM from PBS into an isolated network
 - Quarterly: PITR a CNPG cluster into a throwaway namespace from B2
@@ -1064,11 +1163,13 @@ homelab/
 │   ├── inventory/
 │   ├── playbooks/
 │   └── roles/
-├── stage2-cluster/            # reconciled by mgmt-cluster Flux
-│   ├── flux/
-│   ├── providers/             # CAPI + CAPMOX + IPAM + autoscaler
-│   ├── clusters/homelab/      # ClusterClass + Cluster topology
-│   └── maintenance/           # scheduled + manual jobs
+├── stage2-cluster/            # applied from the runner LXC (Semaphore)
+│   ├── talconfig.yaml         # ← the ONLY place Talos node config is written
+│   ├── talenv.yaml            # version vars substituted into talconfig (Renovate target)
+│   ├── tofu/                  # VM definitions, bpg/proxmox provider, state backend
+│   ├── cilium/                # values rendered into talhelper inlineManifests
+│   ├── clusterconfig/         # gitignored — rendered output, never committed
+│   └── maintenance/           # scheduled + manual job definitions
 └── stage3-platform/           # reconciled by workload-cluster Flux
     ├── clusters/homelab/
     ├── infrastructure/
@@ -1082,7 +1183,11 @@ homelab/
 | Repo | Visibility | Contains |
 |---|---|---|
 | `homelab` (this one) | **public** | All stages' manifests, Ansible, docs — everything except secret material |
-| `homelab-secrets` | **private** | SOPS+age encrypted `Secret` manifests only |
+| `homelab-secrets` | **private** | SOPS+age encrypted material only: Kubernetes `Secret` manifests, and **`talsecret.sops.yaml`** — the Talos secrets bundle (cluster CAs, bootstrap token, etcd PKI) that `talhelper genconfig` needs (§6.1) |
+
+`talsecret.sops.yaml` is consumed by the runner, not by Flux, but belongs here for the same
+reason and under the same key. Losing it does not lose the cluster — but it does lose the
+ability to add a node or re-render a config, which is most of what stage 2 is for.
 
 Flux consumes both via separate `GitRepository` sources. Coupling is minimal because Kubernetes
 Secrets are referenced **by name**, not by path: the private repo delivers `Secret` objects into
@@ -1126,7 +1231,7 @@ Encrypted **and** private is genuine defence in depth, and costs one extra repos
 
 #### Never in Git, in any repo or form
 
-- The **age private key** (password manager + offline copy — see §5.6)
+- The **age private key** (password manager + offline copy — see §5.5)
 - The **B2 master application key** (use per-bucket scoped keys, §7.7)
 - Anything that cannot be rotated
 
@@ -1140,11 +1245,12 @@ follows the table.
 | # | Decision | Choice | Why in one line |
 |---|---|---|---|
 | D1 | Node OS & bootstrap | **Talos Linux** | Immutable, API-driven upgrades, and no Packer image pipeline to own |
-| D2 | Cluster lifecycle engine | **Cluster API + CAPMOX + IPAM** | The only option that delivers autoscaling declaratively |
-| D3 | Management-plane placement | **Dedicated single-node mgmt cluster VM** | The difference between "the cluster rebuilds itself" and "I rebuild the cluster" |
+| D2 | Cluster lifecycle engine | **talhelper + OpenTofu (`bpg/proxmox`) + `talosctl`** | The whole cluster is one YAML file and a `tofu` module; no controllers, no CRDs, no alpha APIs |
+| D2a | Autoscaling | **None — fixed node pools** | The constraint is disk, which has to be hand-budgeted anyway; autoscaling was a lot of machinery to reach a number chosen by hand (§6.6) |
+| D3 | Management-plane placement | **None — stage 2 runs from the `runner` LXC** | With no controllers to host, a whole Kubernetes cluster to hold them is pure overhead (§3) |
 | D4 | DHCP + DNS | **OPNsense keeps DHCP + resolver; PowerDNS in `netcore` for `internal.<domain>` only** | Household infrastructure must not live on the box this project rebuilds; `external-dns` needs dynamic updates OPNsense can't do |
-| D5 | Stage 1 job runner UI | **Semaphore UI** | Single Go binary, runs Ansible *and* OpenTofu, fits an LXC, works when Kubernetes doesn't |
-| D6 | Stage 2 day-2 ops UI | **Semaphore + a Flux UI** (Capacitor / Headlamp) | Semaphore runs things, the Flux UI observes and forces reconciliation. Add Argo Workflows later only if maintenance grows genuinely multi-step |
+| D5 | Stage 1 + 2 job runner UI | **Semaphore UI** | Single Go binary, runs Ansible *and* OpenTofu, fits an LXC, works when Kubernetes doesn't — and under D2 it is the cluster's lifecycle engine, not a convenience |
+| D6 | Day-2 ops UI | **Semaphore + a Flux UI** (Capacitor / Headlamp) | Semaphore runs things, the Flux UI observes and forces reconciliation. Add Argo Workflows later only if maintenance grows genuinely multi-step |
 | D7 | Storage | **Proxmox CSI (tiered) + static NFS RWX, no in-cluster S3** | ZFS already gives redundancy and snapshots; replication on top would cost 2–3× of the scarcest resource |
 | D8 | CNI | **Cilium** | Folds LB-IPAM and Gateway API into the CNI, removing two components |
 | D9 | Gateway implementation | **Cilium Gateway API** | Follows from D8 — no extra component, eBPF data path. ingress-nginx is EOL (§7.3) |
@@ -1163,9 +1269,10 @@ follows the table.
   would sit on zvols on top of ZFS — copy-on-write on copy-on-write, with bad write
   amplification. A clear no. **Revisit seriously if a second and third physical node appear** —
   Proxmox CSI does not close that door.
-- **Longhorn.** The usual homelab default, and it would work, but replica placement pins nodes
-  and fights scale-down (§6.4), NFS-based RWX is a performance and failure-mode compromise, and
-  it is another replication layer on top of ZFS you don't need (§2.6).
+- **Longhorn.** The usual homelab default, and it would work, but it is another replication
+  layer on top of ZFS you don't need, at 2–3× of the scarcest resource (§2.6), and its
+  NFS-based RWX is a performance and failure-mode compromise next to a plain export from the
+  `nas` LXC.
 - **democratic-csi over NFS/iSCSI.** Leans on ZFS directly and is mature, but needs a NAS VM or
   host-side export in the data path for what static PVs already achieve here.
 - **SeaweedFS / JuiceFS.** Closest to one system for everything, but PVCs are FUSE mounts, so
@@ -1183,12 +1290,28 @@ follows the table.
 > write-once blobs, unsafe for databases. Object storage here is a **backup and bulk-data
 > target**, layered on top of real block storage, never a replacement for it.
 
-### D2 — the residual risk
+### D2 — what was given up, and why it was worth it
 
-CAPMOX is a modest project and still on `v1alpha2` with `v1alpha3` in flight, so breaking API
-changes should be expected. That risk is real, but the alternative (OpenTofu + `bpg/proxmox`)
-means writing and maintaining your own autoscaler, which is strictly more risk. Pin provider
-versions and read release notes before upgrades.
+The alternative was Cluster API with the Proxmox provider (CAPMOX), a Talos bootstrap provider,
+an IPAM provider and a ClusterClass. It is the more impressive architecture and it buys two
+genuine things: continuous reconciliation (a deleted node comes back on its own) and
+declarative autoscaling.
+
+Neither survives contact with this hardware. Autoscaling is ruled out on its own merits (D2a).
+And self-healing is worth much less on a single host than it sounds: the failure modes it
+covers — a node VM lost, a machine template drifting — are ones where the host is still up and
+a job run fixes it in minutes, while the failure mode that actually ends the day is the host
+itself, which no in-cluster controller helps with.
+
+Against that: CAPMOX is a modest project still on `v1alpha2` with `v1alpha3` in flight, so
+breaking API changes were an expected cost, on top of CAPI core's own upgrade cadence, and all
+of it needed a permanent extra Kubernetes cluster to run in (D3). talhelper's failure mode by
+comparison is a CLI that renders YAML: if the project stalled tomorrow, the rendered machine
+configs are plain Talos config and still apply.
+
+**Revisit if a second and third physical node appear.** At that point self-healing starts
+covering real failures rather than convenient ones, and the fixed cost of a management cluster
+is amortised across an estate rather than carried by one box.
 
 ### D11 — the upgrade path
 
@@ -1208,17 +1331,19 @@ bootstrap dependency.
 | No stateful inspection or IDS between VLANs | East-west traffic is filtered only by stateless ACLs; a compromised client has unfiltered reach into mgmt and servers, since VLAN 40 is a trusted tier (§4.5) | Accepted — the 10 Gb requirement rules out router-on-a-stick (§4.1), and trusting the client VLAN is a deliberate choice for usability. The blast radius shrinks once IoT/guest devices leave VLAN 40 (§4.8) |
 | Wireless behind the unmanaged switch | Every phone and smart plug shares the trusted VLAN 40 with the workstation, so an untrusted device reaches mgmt unfiltered | Accepted for now; §4.8 option 3 (APs on the 5130) is the exit, and is cheapest if cable is being run anyway |
 | OPNsense outbound NAT / static route missing after a rebuild | Every VLAN silently has no internet; looks like a switch fault | Both are in `stage0-network` and asserted by `verify.yml` (§4.4, §4.7) |
-| **ZFS pool fills up** | Writes fail cluster-wide; severe performance degradation past 80% | The main capacity risk on this hardware. Alert at 75%; cap metrics/Loki retention; conservative autoscaler `max-size`; add disks via `zpool attach` (§2.5) |
+| **ZFS pool fills up** | Writes fail cluster-wide; severe performance degradation past 80% | The main capacity risk on this hardware. Alert at 75%; cap metrics/Loki retention; node count is fixed and budgeted (§2.6, §6.6); add disks via `zpool attach` (§2.5) |
 | 8K `volblocksize` left in place on RAID-Z1 | ~166% space usage — hundreds of GB wasted | Verify and set ≥16K in stage 1 (§5.1); migrate any existing volumes |
-| Autoscaler exceeds host disk capacity | Pool fills; new VMs fail to start | Explicit capacity budget (§2.6); `max-size: 6`; alert on pool usage, not just memory |
-| CAPMOX API instability (`v1alpha2` → `v1alpha3`) | Breaking changes on upgrade | Pin provider versions; read release notes; never bump blind; keep a tested rollback |
+| Adding nodes ad hoc without re-checking the budget | Pool fills; new VMs fail to start | Node count and root-disk size are explicit in `talconfig.yaml` and §2.6; alert on pool usage at 75%, not just memory |
 | Postgres write amplification on RAID-Z1 | Poor DB performance | Assessed negligible at ~30 tps (§2.7); revisit with a mirror vdev only if load grows materially |
 | Second disk failure during an `hddpool` resilver | Pool lost, restore from B2 required | Accepted: drives are of differing ages (uncorrelated wear) and B2 covers the data regardless — the cost is restore time, not data |
 | PBS GC fails under compliance-mode Object Lock | `homelab-pbs` grows without bound | Test on a throwaway bucket before relying on it; governance mode is the likely compromise (§7.7) |
 | Single host failure | Total outage | Accepted by design — off-box backups (D14) and a tested rebuild path are the answer |
-| Management cluster loss | Can't reconcile stage 2 | Stage 1 recreates it from Ansible; back up its etcd and the Flux bootstrap secrets |
-| Secret root key loss | Cannot decrypt anything in Git | Password manager + offline copy; document the recovery procedure |
+| **No controller repairs a failed node** | A dead node stays dead until someone notices | Accepted, deliberately (§3, D2). Alert on `NotReady` nodes so "notices" is not a person spotting it; the repair is a job run, not a runbook (§6.7) |
+| `runner` LXC lost | Nothing can build or repair the cluster | It is a 10 GB LXC rebuilt by stage 1 Ansible, backed up by PBS, holding no unique state except OpenTofu state — which must be backed up or kept in the private repo |
+| `talsecret.sops.yaml` lost | Cannot render configs, so cannot add or re-provision a node | Private repo (§8.1) plus the age key backup; the running cluster survives, but stage 2 does not |
+| Secret root key loss | Cannot decrypt anything in Git, **including the Talos secrets bundle** | Password manager + offline copy; document the recovery procedure |
 | Talos learning curve | Slow early progress | Build a throwaway cluster first; keep `talosctl` access documented |
+| OpenTofu state corruption or loss | `tofu` no longer knows which VMs it owns; risk of duplicate or orphaned VMs | Keep state on the runner with a backup to the private repo or B2; `tofu import` is the recovery path, and with 6 VMs it is tedious rather than fatal |
 | Gateway API learning curve | Slow stage 3 | Start with one Gateway and one HTTPRoute; migrate incrementally |
 
 ---
@@ -1233,20 +1358,22 @@ Each phase should end with something demonstrably working.
 | **0a** | **Stage 0 by hand, from the console.** Confirm the 5130's feature set and the PERC's HBA mode (§2.1); serial console tested; VLANs + SVIs + transit /30; OPNsense static route, outbound NAT and DHCP relay subnets; Proxmox trunk with PVID 10. *Exit: every VLAN routes, the PC sustains ≥5 Gbit/s to a VM in VLAN 20, and OPNsense's Git config backup is on.* |
 | **0b** | **Stage 0 as code.** `network.yml`, the Comware template, the OPNsense role, `verify.yml`/`apply.yml`, WireGuard, SAFETY-NET rollback proven by deliberately breaking a config. *Exit: `verify.yml` reports zero drift, and ACLs enforce the trust hierarchy (§4.5).* Do this only once 0a is stable — you want a known-good config to render *toward*. |
 | **1** | Stage 1 Ansible: Proxmox host config, `pvecm create`, **create `hddpool`**, verify `volblocksize`, VLAN-aware `vmbr0`, `netcore` LXC. *Exit: internal DNS zone resolves and accepts a dynamic update; both pools present; host reproducible.* |
-| **2** | Stage 1 continued: `runner` LXC + Semaphore, `nas` LXC (SMB + NFS), secrets root. *Exit: a job runs from the UI; SMB share mounts from a desktop.* |
+| **2** | Stage 1 continued: `runner` LXC + Semaphore + the pinned stage 2 toolchain (§5.3), `nas` LXC (SMB + NFS), secrets root. *Exit: a job runs from the UI; SMB share mounts from a desktop; `talhelper` renders from an encrypted secret file.* |
 | **2b** | **PBS: local datastore on `hddpool` + B2 S3 datastore + sync job.** *Exit: a VM backup exists locally and in B2, and a test restore succeeds.* Done early deliberately — everything after this is recoverable. |
-| **3** | Stage 1 continued: management cluster VM + Flux bootstrap. *Exit: Flux reconciles `stage2/`.* |
-| **4** | Stage 2: CAPI + Talos + CAPMOX providers and a **throwaway** workload cluster. *Exit: cluster created purely from Git.* |
-| **5** | Stage 2: ClusterClass, node pools, Talos image refresh flow. *Exit: a version bump rolls the cluster.* |
-| **6** | Stage 2: cluster-autoscaler + capacity budget. *Exit: burst pool scales up and back to zero.* |
-| **7** | Stage 3: Flux, Cilium config, cert-manager, both Gateways, external-dns. *Exit: a test app is reachable internally and externally with valid certs.* |
+| **3** | Stage 2: the OpenTofu module and a **throwaway single-node** Talos cluster, applied by hand from the runner. *Exit: `talosctl` reaches a booted node and `kubectl get nodes` works.* |
+| **4** | Stage 2: full `talconfig.yaml` — 3 control plane + 3 workers, static addressing, Talos VIP, Cilium as an inlineManifest. *Exit: `kubectl get nodes` shows six Ready nodes with no manual CNI install.* |
+| **5** | Stage 2: wrap the §6.2 sequence as Semaphore jobs; prove upgrades and rebuild. *Exit: destroying the cluster and re-running one job chain rebuilds it; a `talosVersion` bump rolls every node.* |
+| **6** | Stage 2: `flux bootstrap` + `sops-age` Secret, etcd snapshot job. *Exit: Flux reconciles `stage3-platform/`; a snapshot restores into a throwaway cluster.* |
+| **7** | Stage 3: Cilium `HelmRelease` adopting the bootstrap install (§7.1), cert-manager, both Gateways, external-dns. *Exit: a test app is reachable internally and externally with valid certs.* |
 | **8** | Stage 3: Proxmox CSI (`proxmox-ssd`, `proxmox-hdd`) + static NFS PVs (`nfs-nas`). *Exit: PVCs provision on both classes and snapshot; the NFS PV mounts and is writable from a pod.* |
 | **9** | Stage 3: monitoring, dashboards, alerting — including **ZFS pool usage alerts at 75%** and iDRAC hardware health. *Exit: alerts reach you.* |
 | **10** | Stage 3: CloudNativePG + B2 backups (mind the §7.7 B2 quirks) + Nextcloud on `nfs-nas`. *Exit: a PITR restore into a fresh cluster succeeds.* |
 | **11** | Maintenance automation, cron jobs, backup/restore drills, runbooks. *Exit: a full rebuild from Git + backups is documented and tested.* |
 
-Phase 4 deliberately uses a throwaway cluster — expect to destroy and recreate it several
-times while the Cluster API configuration settles. Don't put real data on it until phase 8.
+Phases 3–5 deliberately use throwaway clusters — expect to destroy and recreate several times
+while `talconfig.yaml` settles. That repetition is the point: it is the same job chain that
+constitutes the disaster-recovery path (§6.7), so exercising it here is what makes it
+trustworthy later. Don't put real data on the cluster until phase 8.
 
 ---
 
@@ -1264,4 +1391,7 @@ moving upstream before they are relied upon.
 | 5 | The PERC exposes all four SAS drives as raw non-RAID devices (§2.1) | Phase 1 |
 | 6 | `volblocksize` on the existing `ssdpool` storage is 16K, not 8K (§2.2, §5.1) | Phase 1 |
 | 7 | PBS garbage collection survives B2 Object Lock — test on a throwaway bucket (§7.7) | Phase 2b |
-| 8 | Barman Cloud plugin (CNPG-I) status, vs the deprecated in-tree `barmanObjectStore` (§7.7) | Phase 10 |
+| 8 | The Image Factory schematic includes `siderolabs/qemu-guest-agent`, and Proxmox actually reports the guest IP (§6.3) | Phase 3 |
+| 9 | `bpg/proxmox` handles the Talos boot flow you choose — ISO vs imported `nocloud` disk — without needing cloud-init that Talos ignores (§6.1) | Phase 3 |
+| 10 | Cilium as a talhelper `inlineManifest` with KubePrism at `localhost:7445` brings nodes Ready without a manual helm install (§6.2) | Phase 4 |
+| 11 | Barman Cloud plugin (CNPG-I) status, vs the deprecated in-tree `barmanObjectStore` (§7.7) | Phase 10 |
