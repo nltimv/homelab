@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# THE SINGLE SOURCE OF TRUTH FOR THE NETWORK  (docs/PLAN.md §4.7)
+# THE SINGLE SOURCE OF TRUTH FOR THE NETWORK
 # =============================================================================
 # Every VLAN, subnet, address and east-west policy statement in the homelab is
 # written here exactly once. Everything else renders from it:
