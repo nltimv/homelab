@@ -1,0 +1,113 @@
+---
+# ---------------------------------------------------------------------------
+# Device identity and the parts of the config that are NOT derived from
+# network.yml. Everything here ends up in the rendered file, and therefore in
+# the running config: `configuration replace` removes whatever is not present,
+# so management access must be modelled here or in `comware_extra_lines`.
+# ---------------------------------------------------------------------------
+comware_sysname: sw-core
+
+# Accounts. `password` is written verbatim, so use the *hashed* form exactly as
+# `display current-configuration` shows it (`hash $h$6$...`) — a plaintext
+# `simple ...` password would both drift on every verify and put a credential
+# in the rendered file. The value itself comes from the private secrets repo.
+comware_users:
+  - name: admin
+    password: "{{ vault_comware_admin_password_hash }}"
+    service_type: ssh terminal
+    role: network-admin
+
+comware_vty_user_role: network-admin
+comware_ntp_servers: []
+
+# Verbatim escape hatches, rendered as-is. `global` lines go near the top (they
+# are indented one space, like Comware's own top-level settings); `extra` lines
+# go at the end and are written at column 0, so they can open whole blocks.
+# This is where anything the model does not cover belongs — SSH public keys,
+# STP tuning, SNMP, logging hosts. See README "Adopting an existing switch".
+comware_global_lines: []
+comware_extra_lines: []
+
+# ACL numbering: advanced ACLs live in 3000-3999, so VLAN 20 -> 3020 (§4.5).
+acl_base: 3000
+rule_step: 10                 # gaps, so inserting a rule never renumbers below it
+acl_permit_any_rule: 1000     # the closing `permit ip`
+comware_acl_comments: true    # render `rule N comment ...` — self-documenting at the console
+
+# Comware echoes well-known ports back by name, so render names for the ports
+# that have them or every verify reports drift. Flip a mapping out if your
+# firmware prints the number instead.
+comware_tcp_port_names:
+  53: domain
+  80: www
+comware_udp_port_names:
+  53: dns
+  67: bootps
+  68: bootpc
+
+# Unconfigured ports are already in VLAN 1, which has no SVI and no route, so
+# they are quarantined by default (§4.2). Set this true to say so explicitly at
+# the cost of ~45 near-identical blocks in the rendered config.
+comware_quarantine_unused: false
+comware_port_ranges:
+  - { prefix: "GigabitEthernet1/0/", first: 1, last: 48 }
+  - { prefix: "Ten-GigabitEthernet1/0/", first: 49, last: 52 }
+
+# --------------------------------------------------------------- apply-time
+# `replace` — scp the file and let Comware diff it (§4.7). Converges exactly,
+#             including removing config that is no longer in the repo.
+# `merge`   — feed the same file through the CLI. Only adds and updates, never
+#             removes. Use it for the first cautious applies, and when
+#             `configuration replace file` is not on your firmware (verify #2).
+comware_apply_method: replace
+
+comware_remote_config_path: "flash:/homelab.cfg"
+comware_build_dir: "{{ playbook_dir }}/../build"
+
+# Break-glass (§4.8). Armed by including it in the config we apply, so it exists
+# in the running config from the instant the risky change lands — and not in the
+# saved config we would reboot back to.
+comware_safety_net: false          # apply.yml turns this on for the apply render
+comware_safety_net_job: SAFETY
+comware_safety_net_schedule: SAFETY-NET
+comware_safety_net_delay: "00:10"  # hh:mm — long enough to test, short enough to wait out
+
+# How to talk to the device. Comware 7 needs `ssh server enable` and
+# `scp server enable`; the account needs the network-admin role.
+comware_ssh_user: "{{ vault_comware_ssh_user | default('admin') }}"
+comware_ssh_port: 22
+comware_ssh_base_argv:
+  - ssh
+  - -T                          # no pty: this is what stops Comware paginating
+  - -o
+  - StrictHostKeyChecking=accept-new
+  - -o
+  - ConnectTimeout=10
+# Comware only speaks the legacy scp protocol, which OpenSSH >= 9 no longer uses
+# by default; -O puts it back. Drop it if your scp does not know the flag.
+comware_scp_base_argv:
+  - scp
+  - -O
+  - -o
+  - StrictHostKeyChecking=accept-new
+
+# Where rendered artefacts land. Nothing here is committed (see .gitignore).
+comware_rendered_path: "{{ comware_build_dir }}/{{ inventory_hostname }}.cfg"
+comware_running_path: "{{ comware_build_dir }}/{{ inventory_hostname }}.running.cfg"
+
+# Verify behaviour.
+comware_fail_on_drift: true
+comware_strict_drift: false      # true also reports device blocks we do not manage
+
+# Fully-assembled argument vectors, so every task talks to the device the same
+# way and there is one place to change transport behaviour.
+comware_ssh_argv: >-
+  {{ comware_ssh_base_argv + ['-p', comware_ssh_port | string,
+                              comware_ssh_user ~ '@' ~ ansible_host] }}
+comware_scp_argv: >-
+  {{ comware_scp_base_argv + ['-P', comware_ssh_port | string] }}
+
+# How long to keep trying to reach the switch after an apply before concluding
+# we have locked ourselves out and letting the safety net do its job.
+comware_post_apply_retries: 10
+comware_post_apply_delay: 15

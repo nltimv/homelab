@@ -1,0 +1,194 @@
+---
+# =============================================================================
+# THE SINGLE SOURCE OF TRUTH FOR THE NETWORK  (docs/PLAN.md §4.7)
+# =============================================================================
+# Every VLAN, subnet, address and east-west policy statement in the homelab is
+# written here exactly once. Everything else renders from it:
+#
+#   stage 0  5130 SVIs, ACLs, DHCP relay, port map   (roles/comware)
+#            OPNsense static route, outbound NAT, filter rules, Kea subnets
+#   stage 1  Proxmox `bridge-vids`, LXC addresses
+#   stage 2  talconfig.yaml node addresses (must sit outside dhcp_pool/lb_pool)
+#   stage 3  CiliumLoadBalancerIPPool  (from vlan 20 `lb_pool`)
+#
+# Do not hand-edit the derived config on either device: `playbooks/verify.yml`
+# will report it as drift, which is the entire point of this file.
+# -----------------------------------------------------------------------------
+
+site:
+  # TODO: set to the real public domain. `internal_zone` is the only zone
+  # `netcore` (PowerDNS) is authoritative for (§4.6); external-dns writes here.
+  domain: example.com
+  internal_zone: internal.example.com
+
+# The supernet every VLAN is carved out of. OPNsense needs a static route and a
+# manual outbound NAT rule for exactly this prefix (§4.4) — automatic outbound
+# NAT only covers directly connected networks, and the router sits in a /30.
+supernet: 10.100.0.0/16
+
+# -----------------------------------------------------------------------------
+# VLANs. VLAN ID == third octet, deliberately (§4.2).
+#
+#   trusted: true   this VLAN may initiate to anything; renders NO ACL at all
+#   dhcp: true      the SVI relays DHCP to OPNsense; also renders a Kea subnet
+#   svi              the switch's address in the VLAN, and the hosts' gateway
+# -----------------------------------------------------------------------------
+vlans:
+  - id: 10
+    name: mgmt
+    subnet: 10.100.10.0/24
+    svi: 10.100.10.2
+    dhcp: false
+    trusted: true
+    description: "Infrastructure: switch, netcore, runner, iDRAC, PVE host"
+
+  - id: 20
+    name: servers
+    subnet: 10.100.20.0/24
+    svi: 10.100.20.2
+    dhcp: true
+    trusted: false
+    description: "Server workloads: Kubernetes nodes, nas LXC, LB VIPs"
+    # First boot of a node only — every Talos address is static (§4.2, §6.1).
+    dhcp_pool: { start: 10.100.20.100, end: 10.100.20.199 }
+    # Cilium LB-IPAM (D10). Stage 3 renders CiliumLoadBalancerIPPool from this.
+    lb_pool: { start: 10.100.20.200, end: 10.100.20.250 }
+    # Hand-allocated, written statically into stage 2's talconfig.yaml.
+    # `playbooks/validate.yml` asserts these never overlap the pools above.
+    allocations:
+      talos_vip: [10.100.20.10]
+      control_plane: [10.100.20.11, 10.100.20.12, 10.100.20.13]
+      workers: [10.100.20.21, 10.100.20.22, 10.100.20.23]
+
+  - id: 40
+    name: clients
+    subnet: 10.100.40.0/24
+    svi: 10.100.40.2
+    dhcp: true
+    trusted: true
+    description: "PC, laptops, phones, TV, APs - everything behind the living-room switch"
+    # Everything here is DHCP with no reservations (§4.2). The pool is the whole
+    # subnet bar the low addresses, which stay free for anything that ever needs
+    # to be pinned.
+    dhcp_pool: { start: 10.100.40.50, end: 10.100.40.250 }
+
+  # VLAN 50 (iot) is deferred (§4.8): the APs hang off an unmanaged switch, so
+  # there is nothing to put in it yet. The trunk to Proxmox already permits it
+  # so enabling it later needs no port change — uncomment, re-render, apply.
+  # - id: 50
+  #   name: iot
+  #   subnet: 10.100.50.0/24
+  #   svi: 10.100.50.2
+  #   dhcp: true
+  #   trusted: false
+  #   description: "IoT / guest"
+
+  - id: 99
+    name: transit
+    subnet: 10.100.99.0/30
+    svi: 10.100.99.2
+    dhcp: false
+    trusted: true          # carries ALL internet return traffic — never ACL it (§4.5)
+    description: "Transit only: OPNsense .1 <-> switch .2. No hosts."
+
+# VLAN 1 has no SVI and no route: unconfigured ports land here by default and
+# are therefore quarantined without any explicit configuration.
+quarantine_vlan: 1
+
+# -----------------------------------------------------------------------------
+# Named infrastructure addresses. Policy rules below reference these by name so
+# that an address is never written twice.
+# -----------------------------------------------------------------------------
+infra_hosts:
+  opnsense: { vlan: 99, ip: 10.100.99.1, description: "Router: NAT, north-south FW, DHCP, resolver, WireGuard" }
+  switch:   { vlan: 10, ip: 10.100.10.2,  description: "HPE 5130 management address (= VLAN 10 SVI)" }
+  netcore:  { vlan: 10, ip: 10.100.10.10, description: "PowerDNS, authoritative for the internal zone" }
+  runner:   { vlan: 10, ip: 10.100.10.11, description: "Semaphore UI / job runner" }
+  idrac:    { vlan: 10, ip: 10.100.10.40, description: "R640 iDRAC" }
+  pve:      { vlan: 10, ip: 10.100.10.41, description: "Proxmox VE host" }
+  nas:      { vlan: 20, ip: 10.100.20.30, description: "nas LXC: SMB + NFS" }
+
+# The default gateway for the whole estate: the switch routes everything it
+# cannot reach directly to OPNsense.
+default_gateway: 10.100.99.1
+
+# WireGuard tunnel subnet. Lives entirely on OPNsense (§4.6); the switch reaches
+# it via the default route, so it needs no SVI and no per-peer rules.
+vpn:
+  subnet: 10.100.98.0/24
+  listen_port: 51820
+
+# -----------------------------------------------------------------------------
+# East-west policy — the trust hierarchy (§4.5)
+#
+#   mgmt (10) ~ clients (40) ~ vpn (98)  >  servers (20)  >  iot (50)
+#
+# ACLs are applied INBOUND on each VLAN interface, i.e. to traffic *sourced by*
+# that VLAN. A `trusted: true` VLAN permits everything and therefore renders no
+# ACL at all — which is also why denied traffic never needs a return-path rule:
+# if servers->clients never establishes, there is no reply to permit.
+#
+# Only VLANs that appear as `from` here get a packet-filter. Everything not
+# denied is permitted (each ACL ends with an explicit `permit ip`, §4.5 note 4).
+# -----------------------------------------------------------------------------
+policy:
+  - from: servers
+    to: mgmt
+    action: deny
+    comment: "Servers may not reach infrastructure, except the four paths the cluster genuinely needs"
+    except:
+      - { host: pve,     proto: tcp, port: 8006, comment: "Proxmox API - Proxmox CSI, plan 7.4" }
+      - { host: netcore, proto: udp, port: 53,   comment: "PowerDNS - plan 4.6" }
+      - { host: netcore, proto: tcp, port: 53,   comment: "PowerDNS - plan 4.6" }
+      - { host: netcore, proto: tcp, port: 8081, comment: "PowerDNS API - external-dns, plan 7.3" }
+      - { host: pve,     proto: tcp, port: 9221, comment: "PVE exporter scrape - plan 7.5" }
+      - { host: idrac,   proto: tcp, port: 443,  comment: "iDRAC Redfish scrape - plan 7.5" }
+
+  - from: servers
+    to: clients
+    action: deny
+    comment: "Servers may not initiate to clients; TCP replies to client-initiated flows are permitted"
+    allow_established: true
+    # A stateless ACL cannot infer UDP flows. Anything a client consumes over
+    # UDP from VLAN 20 — HTTP/3 on a Gateway is the realistic one — needs its
+    # source port listing here, or TCP will work and QUIC will silently not.
+    allow_reply_udp_ports: []          # e.g. [443] once HTTP/3 is enabled
+
+  # When VLAN 50 lands (§4.8) it gets the mirror-image policy: deny to every
+  # internal VLAN, permit to the internet.
+  # - { from: iot, to: mgmt,    action: deny }
+  # - { from: iot, to: servers, action: deny }
+  # - { from: iot, to: clients, action: deny }
+
+# -----------------------------------------------------------------------------
+# North-south policy stays on OPNsense and stays stateful (§4.4). Only the
+# east-west policy above moved to the switch.
+# -----------------------------------------------------------------------------
+internet_egress:
+  - { vlan: mgmt,    action: permit }
+  - { vlan: servers, action: permit }
+  - { vlan: clients, action: permit }
+  # - { vlan: iot,   action: permit }   # internet yes, internal no (see policy)
+
+# -----------------------------------------------------------------------------
+# Physical port map (§4.3). Exactly one trunk in the whole estate.
+# TODO: confirm the port numbers against how the estate is actually patched.
+# -----------------------------------------------------------------------------
+ports:
+  - name: GigabitEthernet1/0/1
+    description: "OPNsense LAN"
+    type: access
+    vlan: 99
+  - name: GigabitEthernet1/0/2
+    description: "R640 iDRAC"
+    type: access
+    vlan: 10
+  - name: Ten-GigabitEthernet1/0/49
+    description: "R640 Proxmox"
+    type: trunk
+    pvid: 10
+    permit: [10, 20, 50]     # 50 pre-permitted so enabling IoT needs no port change
+  - name: Ten-GigabitEthernet1/0/51
+    description: "living-room switch (unmanaged)"
+    type: access
+    vlan: 40

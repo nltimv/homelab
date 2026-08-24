@@ -1,0 +1,190 @@
+{#
+  ===========================================================================
+  HPE 5130 EI — full device configuration, rendered from network.yml
+
+  This is the ENTIRE configuration of the switch, not a fragment:
+  `configuration replace` diffs the running config against this file and
+  applies the delta, so anything absent here is REMOVED from the device.
+  Management access that is not modelled below belongs in
+  `comware_extra_lines` — see roles/comware/defaults/main.yml.
+
+  Rendered by roles/comware (Ansible) and by tools/render.py (standalone),
+  both with trim_blocks and lstrip_blocks on.
+  ===========================================================================
+#}
+{%- macro port_ref(proto, port) -%}
+{%- if proto == 'tcp' -%}
+{{ comware_tcp_port_names.get(port, port) }}
+{%- else -%}
+{{ comware_udp_port_names.get(port, port) }}
+{%- endif -%}
+{%- endmacro -%}
+{% set vlan_by_name = {} %}
+{% for v in vlans %}{% set _ = vlan_by_name.update({v.name: v}) %}{% endfor %}
+#
+ sysname {{ comware_sysname }}
+#
+{% if vlans | selectattr('dhcp') | list | length > 0 %}
+ dhcp enable
+#
+{% endif %}
+{% if comware_global_lines %}
+{% for line in comware_global_lines %}
+ {{ line }}
+{% endfor %}
+#
+{% endif %}
+{#  ------------------------------------------------------------- VLANs  #}
+vlan {{ quarantine_vlan }}
+ description quarantine - no SVI, no route
+#
+{% for vlan in vlans | sort(attribute='id') %}
+vlan {{ vlan.id }}
+ name {{ vlan.name }}
+ description {{ vlan.description }}
+#
+{% endfor %}
+{#  ----------------------------------------------- east-west ACLs (§4.5)
+    One ACL per VLAN that appears as `from` in a deny policy. Trusted VLANs
+    permit everything and so render nothing at all — including the transit
+    VLAN, which carries every packet of internet return traffic in the house.
+#}
+{% for vlan in vlans | sort(attribute='id') %}
+{% set rules = policy | selectattr('from', 'equalto', vlan.name) | selectattr('action', 'equalto', 'deny') | list %}
+{% if rules %}
+{% set ns = namespace(n=0) %}
+acl advanced {{ acl_base + vlan.id }}
+ description east-west policy for VLAN {{ vlan.id }} ({{ vlan.name }}) - rendered, do not edit
+{% if vlan.dhcp %}
+{#    Not optional: DHCP relay breaks without it, and the symptom — no address
+      — looks nothing like an ACL problem (§4.5 note 1). #}
+ rule 5 permit udp destination-port eq {{ port_ref('udp', 67) }}
+{% if comware_acl_comments %}
+ rule 5 comment DHCP relay to OPNsense
+{% endif %}
+{% endif %}
+{% for rule in rules %}
+{% set dst = vlan_by_name[rule.to] %}
+{% for permit in rule.get('except', []) %}
+{% set ns.n = ns.n + rule_step %}
+ rule {{ ns.n }} permit {{ permit.proto }} destination {{ infra_hosts[permit.host].ip }} 0 destination-port eq {{ port_ref(permit.proto, permit.port) }}
+{% if comware_acl_comments %}
+ rule {{ ns.n }} comment {{ permit.comment }}
+{% endif %}
+{% endfor %}
+{% if rule.get('allow_established') %}
+{% set ns.n = ns.n + rule_step %}
+ rule {{ ns.n }} permit tcp destination {{ dst.subnet | network }} {{ dst.subnet | wildcard }} established
+{% if comware_acl_comments %}
+ rule {{ ns.n }} comment TCP replies to flows {{ dst.name }} started
+{% endif %}
+{% endif %}
+{% for udp_port in rule.get('allow_reply_udp_ports', []) %}
+{% set ns.n = ns.n + rule_step %}
+ rule {{ ns.n }} permit udp source-port eq {{ port_ref('udp', udp_port) }} destination {{ dst.subnet | network }} {{ dst.subnet | wildcard }}
+{% if comware_acl_comments %}
+ rule {{ ns.n }} comment UDP replies from port {{ udp_port }} to {{ dst.name }}
+{% endif %}
+{% endfor %}
+{% set ns.n = ns.n + rule_step %}
+ rule {{ ns.n }} deny ip destination {{ dst.subnet | network }} {{ dst.subnet | wildcard }}
+{% if comware_acl_comments %}
+ rule {{ ns.n }} comment {{ rule['from'] }} may not initiate to {{ rule.to }}
+{% endif %}
+{% endfor %}
+{#    Explicit, rather than trusting Comware's implicit default action
+      (§4.5 note 4). #}
+ rule {{ acl_permit_any_rule }} permit ip
+{% if comware_acl_comments %}
+ rule {{ acl_permit_any_rule }} comment internet and anything not denied above - OPNsense filters north-south
+{% endif %}
+#
+{% endif %}
+{% endfor %}
+{#  ------------------------------------------------------- SVIs / routing  #}
+{% for vlan in vlans | sort(attribute='id') %}
+{% set filtered = policy | selectattr('from', 'equalto', vlan.name) | selectattr('action', 'equalto', 'deny') | list %}
+interface Vlan-interface{{ vlan.id }}
+ description {{ vlan.name }} - {{ vlan.description }}
+ ip address {{ vlan.svi }} {{ vlan.subnet | netmask }}
+{% if vlan.dhcp %}
+ dhcp select relay
+ dhcp relay server-address {{ infra_hosts.opnsense.ip }}
+{% endif %}
+{% if filtered %}
+ packet-filter {{ acl_base + vlan.id }} inbound
+{% endif %}
+#
+{% endfor %}
+{#  ------------------------------------------------------- physical ports  #}
+{% for port in ports %}
+interface {{ port.name }}
+ description {{ port.description }}
+{% if port.type == 'trunk' %}
+ port link-type trunk
+ port trunk permit vlan {{ port.permit | sort | join(' ') }}
+ port trunk pvid vlan {{ port.pvid }}
+ undo port trunk permit vlan {{ quarantine_vlan }}
+{% else %}
+ port access vlan {{ port.vlan }}
+{% endif %}
+#
+{% endfor %}
+{% if comware_quarantine_unused %}
+{% set configured = ports | map(attribute='name') | list %}
+{% for pr in comware_port_ranges %}
+{% for index in range(pr.first, pr.last + 1) if (pr.prefix ~ index) not in configured %}
+interface {{ pr.prefix }}{{ index }}
+ description unused - quarantine
+ port access vlan {{ quarantine_vlan }}
+#
+{% endfor %}
+{% endfor %}
+{% endif %}
+{#  ---------------------------------------------------------------- routing  #}
+ ip route-static 0.0.0.0 0 {{ default_gateway }}
+#
+{#  ------------------------------------------------------------- management  #}
+ ssh server enable
+ scp server enable
+#
+{% for user in comware_users %}
+local-user {{ user.name }} class manage
+ password {{ user.password }}
+ service-type {{ user.service_type }}
+ authorization-attribute user-role {{ user.role }}
+#
+{% endfor %}
+line vty 0 63
+ authentication-mode scheme
+ user-role {{ comware_vty_user_role }}
+#
+{% if comware_ntp_servers %}
+ ntp-service enable
+{% for server in comware_ntp_servers %}
+ ntp-service unicast-server {{ server }}
+{% endfor %}
+#
+{% endif %}
+{% if comware_extra_lines %}
+{% for line in comware_extra_lines %}
+{{ line }}
+{% endfor %}
+#
+{% endif %}
+{% if comware_safety_net %}
+{#  ------------------------------------------------- break-glass (§4.8)
+    Armed only during apply.yml, never part of the steady-state config: if
+    this file locks us out, the switch reboots to the last SAVED config,
+    which is the one it was running before. apply.yml disarms it and saves
+    once reachability has been proven again.
+#}
+scheduler job {{ comware_safety_net_job }}
+ command 1 reboot force
+#
+scheduler schedule {{ comware_safety_net_schedule }}
+ job {{ comware_safety_net_job }}
+ time once delay {{ comware_safety_net_delay }}
+#
+{% endif %}
+return

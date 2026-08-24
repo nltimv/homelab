@@ -1,0 +1,30 @@
+---
+# Read-only drift check (§4.7). Renders from network.yml, pulls the running
+# config, and compares the blocks this repo manages. Never writes to the device.
+
+- name: comware | render
+  ansible.builtin.import_tasks: render.yml
+
+- name: comware | fetch running configuration
+  ansible.builtin.import_tasks: fetch.yml
+
+- name: comware | compare running against rendered
+  ansible.builtin.set_fact:
+    comware_drift: >-
+      {{ comware_running.stdout | comware_drift(comware_rendered_config,
+                                                strict=comware_strict_drift) }}
+
+- name: comware | drift report
+  ansible.builtin.debug:
+    msg: "{{ comware_drift | comware_drift_lines }}"
+
+- name: comware | fail when the device does not match the repo
+  ansible.builtin.assert:
+    that: not (comware_drift | comware_has_drift)
+    fail_msg: >-
+      {{ inventory_hostname }} has drifted from network.yml. Reconcile it with
+      `playbooks/apply.yml`, or fold intentional device-side changes back into
+      network.yml / comware_extra_lines. Rendered: {{ comware_rendered_path }},
+      running: {{ comware_running_path }}.
+    success_msg: "{{ inventory_hostname }} matches network.yml"
+  when: comware_fail_on_drift | bool

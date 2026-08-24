@@ -1,0 +1,28 @@
+---
+# Converge OPNsense onto network.yml. Every task here is idempotent, so running
+# it under `check_mode` is exactly the drift check that verify.yml performs —
+# there is no second description of the desired state to keep in step.
+
+- name: opnsense | static route and the supernet alias
+  ansible.builtin.import_tasks: route.yml
+  when: opnsense_manage_route | bool
+
+- name: opnsense | manual outbound NAT
+  ansible.builtin.import_tasks: nat.yml
+  when: opnsense_manage_nat | bool
+
+- name: opnsense | filter rules
+  ansible.builtin.import_tasks: rules.yml
+  when: opnsense_manage_rules | bool
+
+- name: opnsense | internal DNS zone override
+  ansible.builtin.import_tasks: dns.yml
+  when: opnsense_manage_dns | bool
+
+- name: opnsense | Kea subnets for the relayed VLANs
+  ansible.builtin.import_tasks: dhcp.yml
+  when: opnsense_manage_dhcp | bool
+
+- name: opnsense | WireGuard
+  ansible.builtin.import_tasks: wireguard.yml
+  when: opnsense_manage_wireguard | bool

@@ -1,0 +1,28 @@
+---
+# The tunnel is a trusted tier (§4.5): a peer reaches mgmt, servers and iot
+# exactly as a host on VLAN 40 does. That is why no peer needs a fixed address
+# and the switch needs no per-peer rules — it reaches 10.100.98.0/24 through
+# the default route like any other unknown destination.
+
+- name: opnsense | WireGuard instance
+  ansibleguy.opnsense.wireguard_server:
+    name: "{{ opnsense_wireguard_instance }}"
+    allowed_ips: ["{{ vpn.subnet }}"]
+    port: "{{ vpn.listen_port }}"
+    state: present
+    enabled: true
+  notify: opnsense object changed
+
+- name: opnsense | WireGuard peers
+  ansibleguy.opnsense.wireguard_peer:
+    name: "{{ item.name }}"
+    public_key: "{{ item.public_key }}"
+    allowed_ips: "{{ item.allowed_ips }}"
+    servers: ["{{ opnsense_wireguard_instance }}"]
+    state: present
+    enabled: true
+  loop: "{{ opnsense_wireguard_peers }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  notify: opnsense object changed

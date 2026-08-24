@@ -1,0 +1,15 @@
+---
+# Automatic outbound NAT only covers *directly connected* networks. With the
+# router in a /30 transit VLAN that means the real VLANs get no internet at all
+# until this rule exists — and the symptom is "DNS works, nothing else does",
+# which sends you looking at the switch for an hour (§4.4).
+
+- name: opnsense | manual outbound NAT for {{ supernet }}
+  ansibleguy.opnsense.source_nat:
+    interface: "{{ opnsense_wan_interface }}"
+    source_net: "{{ supernet }}"
+    destination_net: any
+    target: interface
+    description: "{{ opnsense_marker }} - outbound NAT for every VLAN"
+    state: present
+  notify: opnsense object changed

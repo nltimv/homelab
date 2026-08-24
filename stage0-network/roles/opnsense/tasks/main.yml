@@ -1,0 +1,5 @@
+---
+# Defaults to the read-only path, for the same reason as roles/comware.
+
+- name: opnsense | verify
+  ansible.builtin.import_tasks: verify.yml

@@ -1,0 +1,84 @@
+---
+# Kea serves the relayed VLANs. The switch relays with `dhcp select relay`, so
+# Kea matches the subnet by `giaddr` — which means these subnets carry no
+# interface binding at all; the relay address is what selects them (§4.6).
+#
+# Driven through the REST API directly rather than through the collection:
+# Kea replaced ISC dhcpd relatively recently and module coverage lags (verify
+# #4, §12). Everything below is add-if-missing — an existing subnet whose
+# details differ is reported, not silently rewritten, because Kea also holds
+# household reservations this repo does not model.
+
+- name: opnsense | list the Kea subnets that already exist
+  ansible.builtin.uri:
+    url: "{{ opnsense_url }}{{ opnsense_kea_search_path }}"
+    method: POST
+    body_format: json
+    body: {}
+    url_username: "{{ opnsense_api_key }}"
+    url_password: "{{ opnsense_api_secret }}"
+    force_basic_auth: true
+    validate_certs: "{{ opnsense_ssl_verify }}"
+  register: opnsense_kea_existing
+  changed_when: false
+  check_mode: false
+
+- name: opnsense | work out which relayed VLANs Kea is missing
+  ansible.builtin.set_fact:
+    opnsense_kea_missing: >-
+      {{ vlans | selectattr('dhcp') | rejectattr('subnet', 'in',
+         opnsense_kea_existing.json.rows | default([]) | map(attribute='subnet') | list) | list }}
+
+- name: opnsense | report relayed VLANs Kea already serves
+  ansible.builtin.debug:
+    msg: >-
+      Kea already has:
+      {{ (opnsense_kea_existing.json.rows | default([]) | map(attribute='subnet') | list) | join(', ') | default('nothing', true) }}
+      - compare pools and router options by hand if a subnet was created in the UI.
+
+# The uri module has no check mode, so a missing subnet would otherwise be
+# invisible to verify.yml. Flag it here, where both modes see it.
+- name: opnsense | drift - Kea has no subnet for a relayed VLAN
+  ansible.builtin.debug:
+    msg: "Kea has no subnet for {{ item.subnet }} (VLAN {{ item.id }}, {{ item.name }})"
+  loop: "{{ opnsense_kea_missing }}"
+  loop_control:
+    label: "{{ item.subnet }}"
+  changed_when: true
+  notify: opnsense object changed
+
+- name: opnsense | create the missing Kea subnets
+  ansible.builtin.uri:
+    url: "{{ opnsense_url }}{{ opnsense_kea_add_path }}"
+    method: POST
+    body_format: json
+    body:
+      subnet4:
+        subnet: "{{ item.subnet }}"
+        description: "{{ opnsense_marker }} - VLAN {{ item.id }} ({{ item.name }}), reached by relay"
+        option_data:
+          routers: "{{ item.svi }}"
+          domain_name_servers: "{{ infra_hosts.opnsense.ip }}"
+          domain_name: "{{ site.internal_zone }}"
+        pools: "{{ item.dhcp_pool.start }} - {{ item.dhcp_pool.end }}"
+    url_username: "{{ opnsense_api_key }}"
+    url_password: "{{ opnsense_api_secret }}"
+    force_basic_auth: true
+    validate_certs: "{{ opnsense_ssl_verify }}"
+  loop: "{{ opnsense_kea_missing }}"
+  loop_control:
+    label: "VLAN {{ item.id }} {{ item.subnet }}"
+  changed_when: true
+
+- name: opnsense | apply the Kea configuration
+  ansible.builtin.uri:
+    url: "{{ opnsense_url }}{{ opnsense_kea_reconfigure_path }}"
+    method: POST
+    body_format: json
+    body: {}
+    url_username: "{{ opnsense_api_key }}"
+    url_password: "{{ opnsense_api_secret }}"
+    force_basic_auth: true
+    validate_certs: "{{ opnsense_ssl_verify }}"
+  when: opnsense_kea_missing | length > 0 and not ansible_check_mode
+  changed_when: true

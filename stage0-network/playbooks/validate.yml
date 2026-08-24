@@ -1,0 +1,18 @@
+---
+# Check network.yml against itself. Runs nowhere near the devices, so it is
+# the first thing to run after any edit — and the first thing CI runs.
+
+- name: Validate the network model
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: network.yml is internally consistent
+      ansible.builtin.command:
+        cmd: "{{ ansible_playbook_python }} {{ playbook_dir }}/../tools/validate.py"
+      changed_when: false
+      register: stage0_validate
+
+    - name: result
+      ansible.builtin.debug:
+        msg: "{{ stage0_validate.stdout_lines }}"

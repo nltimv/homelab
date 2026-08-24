@@ -1,0 +1,39 @@
+---
+# Read-only drift check for both devices (§4.7). Touches nothing: the switch is
+# only asked for `display current-configuration`, and the router's desired
+# state is evaluated in check mode.
+#
+#   ansible-playbook playbooks/verify.yml
+#
+# A clean run of this is the first stage 0 exit criterion.
+
+- name: Validate the network model
+  ansible.builtin.import_playbook: validate.yml
+
+- name: Verify the switch
+  hosts: switches
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: comware drift check
+      ansible.builtin.include_role:
+        name: comware
+        tasks_from: verify
+
+- name: Verify the router
+  hosts: routers
+  connection: local
+  gather_facts: false
+  vars:
+    opnsense_verify_mode: true
+  module_defaults:
+    group/ansibleguy.opnsense.all:
+      firewall: "{{ ansible_host }}"
+      api_key: "{{ opnsense_api_key }}"
+      api_secret: "{{ opnsense_api_secret }}"
+      ssl_verify: "{{ opnsense_ssl_verify }}"
+  tasks:
+    - name: opnsense drift check
+      ansible.builtin.include_role:
+        name: opnsense
+        tasks_from: verify

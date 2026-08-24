@@ -1,0 +1,35 @@
+---
+# Render the full device configuration from network.yml. Nothing here touches
+# the switch, so it is safe to run at any time (and CI runs exactly this).
+
+- name: comware | ensure the build directory exists
+  ansible.builtin.file:
+    path: "{{ comware_build_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  check_mode: false
+
+- name: comware | render the switch configuration
+  ansible.builtin.template:
+    src: 5130.cfg.j2
+    dest: "{{ comware_rendered_path }}"
+    mode: "0644"
+    lstrip_blocks: true
+    trim_blocks: true
+  delegate_to: localhost
+  changed_when: false
+  check_mode: false
+
+- name: comware | read back what we rendered
+  ansible.builtin.slurp:
+    src: "{{ comware_rendered_path }}"
+  delegate_to: localhost
+  register: comware_rendered_slurp
+  check_mode: false
+
+- name: comware | keep the rendered config in a fact
+  ansible.builtin.set_fact:
+    comware_rendered_config: "{{ comware_rendered_slurp.content | b64decode }}"

@@ -1,0 +1,21 @@
+---
+# The single most load-bearing object on the router. Without it OPNsense knows
+# only the /30 it is directly connected to, and every real VLAN is unreachable
+# from the internet side of the house (§4.4).
+
+- name: opnsense | alias for the homelab supernet
+  ansibleguy.opnsense.alias:
+    name: "{{ opnsense_supernet_alias }}"
+    type: network
+    content: ["{{ supernet }}"]
+    description: "{{ opnsense_marker }}"
+    state: present
+  notify: opnsense object changed
+
+- name: opnsense | static route {{ supernet }} via the switch
+  ansibleguy.opnsense.route:
+    network: "{{ supernet }}"
+    gateway: "{{ opnsense_transit_gateway }}"
+    description: "{{ opnsense_marker }} - every VLAN lives behind the switch"
+    state: present
+  notify: opnsense object changed

@@ -1,0 +1,15 @@
+---
+# Unbound stays the resolver for every client; it just forwards one zone to
+# netcore, which is authoritative for it and accepts the dynamic updates
+# external-dns makes (§4.6). Clients keep pointing at OPNsense via DHCP and
+# nothing else changes — and if the Proxmox host is down, only names that
+# resolve to services on that host stop resolving.
+
+- name: opnsense | forward {{ site.internal_zone }} to netcore
+  ansibleguy.opnsense.unbound_domain:
+    domain: "{{ site.internal_zone }}"
+    server: "{{ infra_hosts.netcore.ip }}"
+    description: "{{ opnsense_marker }} - authoritative internal zone"
+    state: present
+    enabled: true
+  notify: opnsense object changed

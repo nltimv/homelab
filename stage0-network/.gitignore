@@ -1,0 +1,13 @@
+# Rendered device configuration and configuration pulled off devices. Both are
+# reproducible from network.yml, and the pulled ones may contain hashes.
+build/
+
+# The vault is a symlink into the private homelab-secrets repo; never commit
+# either the link target's content or a decrypted copy.
+group_vars/all/vault.sops.yml
+group_vars/all/vault.yml
+*.decrypted.yml
+
+# Python bytecode from the stage 0 tools
+__pycache__/
+*.pyc

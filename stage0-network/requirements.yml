@@ -1,0 +1,11 @@
+---
+collections:
+  # OPNsense REST API modules. Confirm its Kea coverage before relying on it
+  # for DHCP — roles/opnsense/tasks/dhcp.yml goes straight to the API for that
+  # reason (plan §12, verify #4).
+  - name: ansibleguy.opnsense
+    version: ">=1.2.0"
+  # Decrypts group_vars/all/vault.sops.yml in place, so no plaintext secret
+  # ever lands on disk.
+  - name: community.sops
+    version: ">=1.6.0"

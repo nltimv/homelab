@@ -1,0 +1,20 @@
+---
+# Render the switch configuration into build/ without going near the device.
+# Useful for reviewing a change as a diff before applying it:
+#
+#   ansible-playbook playbooks/render.yml && git diff --no-index \
+#     build/sw-core.cfg.previous build/sw-core.cfg
+
+- name: Render the switch configuration
+  hosts: switches
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: comware render
+      ansible.builtin.include_role:
+        name: comware
+        tasks_from: render
+
+    - name: rendered
+      ansible.builtin.debug:
+        msg: "wrote {{ comware_rendered_path }}"

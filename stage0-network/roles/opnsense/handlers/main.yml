@@ -1,0 +1,14 @@
+---
+# Notified by every task that would create or change an object on the router.
+# In `apply` runs it just reloads the relevant service; in `verify` runs (which
+# execute the same tasks in check mode) it is what turns "would change" into a
+# failed drift check.
+
+- name: opnsense object changed
+  ansible.builtin.assert:
+    that: not (opnsense_verify_mode | bool and opnsense_fail_on_drift | bool)
+    fail_msg: >-
+      OPNsense has drifted from network.yml. The tasks reported as "changed"
+      above name the objects that do not match; re-run playbooks/apply.yml to
+      reconcile them, or fold an intentional change back into network.yml.
+    success_msg: "OPNsense objects converged"

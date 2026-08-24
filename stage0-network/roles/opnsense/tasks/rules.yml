@@ -1,0 +1,63 @@
+---
+# North-south policy (§4.4). East-west policy is not here and must never be:
+# inter-VLAN traffic is switched in the 5130's ASIC and never reaches this box.
+#
+# Every VLAN arrives on the transit interface, so per-VLAN internet policy is
+# matched on source subnet — exactly as it was when each VLAN had its own
+# interface on the router.
+
+- name: opnsense | permit {{ item.vlan }} to the internet
+  ansibleguy.opnsense.rule:
+    interface: "{{ opnsense_transit_interface }}"
+    direction: in
+    action: "{{ 'pass' if item.action == 'permit' else 'block' }}"
+    quick: true
+    ip_protocol: inet
+    protocol: any
+    source_net: "{{ (vlans | selectattr('name', 'equalto', item.vlan) | first).subnet }}"
+    destination_net: any
+    sequence: "{{ opnsense_rule_sequence_base + (loop_index * 10) }}"
+    description: "{{ opnsense_marker }} - {{ item.vlan }} egress"
+    state: present
+    enabled: true
+  loop: "{{ internet_egress }}"
+  loop_control:
+    index_var: loop_index
+    label: "{{ item.vlan }} -> internet: {{ item.action }}"
+  notify: opnsense object changed
+
+# The rule that makes the /30 work: traffic from every VLAN is sourced from
+# 10.100.0.0/16, not from the transit subnet, so a rule scoped to the /30
+# would match nothing at all (§4.4).
+- name: opnsense | permit the supernet inbound on the transit interface
+  ansibleguy.opnsense.rule:
+    interface: "{{ opnsense_transit_interface }}"
+    direction: in
+    action: pass
+    quick: true
+    ip_protocol: inet
+    protocol: any
+    source_net: "{{ opnsense_supernet_alias }}"
+    destination_net: any
+    sequence: "{{ opnsense_rule_sequence_base + 900 }}"
+    description: "{{ opnsense_marker }} - supernet, not just the /30"
+    state: present
+    enabled: true
+  notify: opnsense object changed
+
+- name: opnsense | permit WireGuard on the WAN
+  ansibleguy.opnsense.rule:
+    interface: "{{ opnsense_wan_interface }}"
+    direction: in
+    action: pass
+    quick: true
+    ip_protocol: inet
+    protocol: UDP
+    source_net: any
+    destination_net: any
+    destination_port: "{{ vpn.listen_port }}"
+    sequence: "{{ opnsense_rule_sequence_base + 950 }}"
+    description: "{{ opnsense_marker }} - WireGuard (§4.6)"
+    state: present
+    enabled: true
+  notify: opnsense object changed

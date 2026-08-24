@@ -1,0 +1,23 @@
+---
+# Pull the running configuration. Read-only: `display` commands need no
+# system-view and change nothing.
+#
+# -T (no pty) is what keeps Comware from paginating the output; without it the
+# capture stops at the first ---- More ---- prompt.
+
+- name: comware | pull the running configuration
+  ansible.builtin.command:
+    argv: "{{ comware_ssh_argv + ['display current-configuration'] }}"
+  delegate_to: localhost
+  register: comware_running
+  changed_when: false
+  check_mode: false
+
+- name: comware | save the running configuration alongside the rendered one
+  ansible.builtin.copy:
+    content: "{{ comware_running.stdout }}\n"
+    dest: "{{ comware_running_path }}"
+    mode: "0644"
+  delegate_to: localhost
+  changed_when: false
+  check_mode: false

@@ -1,10 +1,14 @@
 # homelab
+
 Automation for my homelab
 
-GitOps automation for a single-server Proxmox VE homelab, in three stages:
+GitOps automation for a single-server Proxmox VE homelab, in four stages, each
+of which can rebuild the one above it:
 
-1. **Bootstrap** — Proxmox host config, DHCP/DNS, secrets root, job-runner UI, management cluster
-2. **Cluster lifecycle** — autoscaled Kubernetes cluster creation, upgrades and maintenance
+0. **[Network](stage0-network/)** — VLANs, inter-VLAN routing and ACLs, DHCP/resolver, the router↔switch boundary. Ansible, run by hand from a workstation, [never reconciled](docs/PLAN.md#4-stage-0--network-foundation)
+1. **Bootstrap** — Proxmox host config, internal DNS, secrets root, job-runner UI
+2. **Cluster lifecycle** — Kubernetes cluster creation, upgrades and maintenance
 3. **Platform & apps** — ingress, certificates, storage, monitoring, PostgreSQL, applications
 
-See [docs/PLAN.md](docs/PLAN.md) for the full plan and the open decision register.
+See [docs/PLAN.md](docs/PLAN.md) for the full plan, the decision register and
+the implementation roadmap.

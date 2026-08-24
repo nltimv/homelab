@@ -1,0 +1,49 @@
+---
+# Converge both devices onto network.yml. This can lock you out of the network
+# it runs over, so it demands an explicit confirmation and arms the switch's
+# self-healing rollback before it changes anything (§4.8):
+#
+#   ansible-playbook playbooks/apply.yml -e confirm=apply
+#   ansible-playbook playbooks/apply.yml -e confirm=apply --limit switches
+#
+# Run it from the workstation, never from the runner LXC: the runner sits
+# behind the switch it would be reconfiguring, on a host whose management VLAN
+# it might be changing (§4).
+#
+# Have the USB-serial adapter within reach. VLAN 10 carries iDRAC, the Proxmox
+# host and the switch's own management address, so a bad VLAN 10 change removes
+# every remote path at once.
+
+- name: Validate the network model
+  ansible.builtin.import_playbook: validate.yml
+
+- name: Apply to the switch
+  hosts: switches
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: comware apply
+      ansible.builtin.include_role:
+        name: comware
+        tasks_from: apply
+
+- name: Apply to the router
+  hosts: routers
+  connection: local
+  gather_facts: false
+  module_defaults:
+    group/ansibleguy.opnsense.all:
+      firewall: "{{ ansible_host }}"
+      api_key: "{{ opnsense_api_key }}"
+      api_secret: "{{ opnsense_api_secret }}"
+      ssl_verify: "{{ opnsense_ssl_verify }}"
+  tasks:
+    - name: refuse to apply without an explicit confirmation
+      ansible.builtin.assert:
+        that: confirm | default('') == 'apply'
+        fail_msg: "Re-run with -e confirm=apply once you are ready to change the router."
+
+    - name: opnsense apply
+      ansible.builtin.include_role:
+        name: opnsense
+        tasks_from: apply

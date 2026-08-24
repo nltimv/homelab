@@ -1,0 +1,18 @@
+---
+# Two devices, both addressed from network.yml so that an address is never
+# written twice. Neither is reached with a normal Ansible connection:
+#   - the switch is driven by ssh/scp commands run from this workstation
+#   - the router is driven by its REST API
+# so every play here runs with `connection: local`.
+all:
+  children:
+    network:
+      children:
+        switches:
+          hosts:
+            sw-core:
+              ansible_host: "{{ infra_hosts.switch.ip }}"
+        routers:
+          hosts:
+            opnsense:
+              ansible_host: "{{ infra_hosts.opnsense.ip }}"

@@ -1,0 +1,166 @@
+---
+# Apply the rendered configuration to the switch (§4.7, §4.8).
+#
+# The order below is the whole safety argument, so do not reorder it:
+#
+#   1. save   — the safety net reboots to the SAVED config, so the saved config
+#               must be the known-good one we are running right now.
+#   2. arm    — the safety net is rendered INTO the config we are about to
+#               apply, so it exists from the instant the risky change lands.
+#               It is not in the saved config, so a reboot removes it.
+#   3. apply  — configuration replace (converges exactly), or merge (adds only).
+#   4. prove  — reachability, then a full drift check.
+#   5. disarm + save — only once step 4 passed. If we lost contact instead,
+#               nobody disarms anything and the switch reboots itself back.
+
+- name: comware | refuse to apply without an explicit confirmation
+  ansible.builtin.assert:
+    that: confirm | default('') == 'apply'
+    fail_msg: >-
+      This rewrites the configuration of {{ inventory_hostname }} and can remove
+      your own access to it. Re-run with -e confirm=apply once you have a serial
+      console within reach (§4.8).
+  run_once: true
+
+- name: comware | apply is not something that can be simulated
+  ansible.builtin.assert:
+    that: not ansible_check_mode
+    fail_msg: >-
+      --check cannot model a switch converging on a config it is reached
+      through. Use playbooks/verify.yml, which is read-only by construction.
+  run_once: true
+
+- name: comware | render the steady-state configuration
+  ansible.builtin.import_tasks: render.yml
+
+- name: comware | fetch running configuration before touching anything
+  ansible.builtin.import_tasks: fetch.yml
+
+- name: comware | show what this apply will change
+  ansible.builtin.debug:
+    msg: >-
+      {{ comware_running.stdout | comware_drift(comware_rendered_config)
+         | comware_drift_lines }}
+
+- name: comware | save the running configuration as the safety net's rollback target
+  ansible.builtin.command:
+    argv: "{{ comware_ssh_argv }}"
+    stdin: |
+      save force
+      quit
+  delegate_to: localhost
+  changed_when: true
+
+- name: comware | re-render with the safety net armed
+  ansible.builtin.import_tasks: render.yml
+  vars:
+    comware_safety_net: true
+
+- name: comware | apply and prove
+  block:
+    - name: comware | copy the configuration to flash
+      ansible.builtin.command:
+        argv: >-
+          {{ comware_scp_argv + [comware_rendered_path,
+             comware_ssh_user ~ '@' ~ ansible_host ~ ':' ~ comware_remote_config_path] }}
+      delegate_to: localhost
+      changed_when: true
+      when: comware_apply_method == 'replace'
+
+    - name: comware | configuration replace (the device diffs and applies the delta)
+      ansible.builtin.command:
+        argv: "{{ comware_ssh_argv }}"
+        stdin: |
+          system-view
+          configuration replace file {{ comware_remote_config_path }}
+          quit
+          quit
+      delegate_to: localhost
+      register: comware_replace
+      changed_when: true
+      failed_when: comware_replace.rc != 0 or ('Error' in comware_replace.stdout)
+      when: comware_apply_method == 'replace'
+
+    # Additive path: feed the same rendered file through the CLI. It never
+    # removes anything, which makes it the right choice for the first applies
+    # and the fallback if `configuration replace file` is not on this firmware.
+    - name: comware | merge the configuration through the CLI
+      ansible.builtin.command:
+        argv: "{{ comware_ssh_argv }}"
+        stdin: |
+          system-view
+          {{ comware_rendered_config }}
+          quit
+      delegate_to: localhost
+      register: comware_merge
+      changed_when: true
+      failed_when: comware_merge.rc != 0 or ('Error' in comware_merge.stdout)
+      when: comware_apply_method == 'merge'
+
+    - name: comware | prove the switch is still reachable
+      ansible.builtin.command:
+        argv: "{{ comware_ssh_argv + ['display version'] }}"
+      delegate_to: localhost
+      register: comware_alive
+      retries: "{{ comware_post_apply_retries }}"
+      delay: "{{ comware_post_apply_delay }}"
+      until: comware_alive.rc == 0
+      changed_when: false
+
+    - name: comware | prove the SVIs answer
+      ansible.builtin.command:
+        argv: [ping, -c, "2", -W, "2", "{{ item.svi }}"]
+      delegate_to: localhost
+      loop: "{{ vlans }}"
+      loop_control:
+        label: "VLAN {{ item.id }} ({{ item.name }}) {{ item.svi }}"
+      register: comware_svi_ping
+      changed_when: false
+      failed_when: false
+
+    - name: comware | report SVIs this workstation cannot reach
+      ansible.builtin.debug:
+        msg: >-
+          Not reachable from here:
+          {{ comware_svi_ping.results | rejectattr('rc', 'equalto', 0)
+             | map(attribute='item.svi') | list | join(', ') | default('none', true) }}
+          (only VLANs this workstation can route to are expected to answer)
+
+    # Deliberately inside the block: if the device did not converge, the rescue
+    # below leaves the safety net armed and it rolls the switch back.
+    - name: comware | confirm the device now matches the repo
+      ansible.builtin.import_tasks: verify.yml
+      vars:
+        comware_safety_net: true     # the armed config is exactly what we rendered
+
+  rescue:
+    - name: comware | the apply did not converge - leave the rollback armed
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} did not converge, so the SAFETY-NET job has
+          been left armed: the switch reboots to the configuration saved at the
+          start of this run, within {{ comware_safety_net_delay }} of the apply.
+          Do nothing and it rolls back. To keep what is on the device instead,
+          get to it now and run `undo scheduler schedule
+          {{ comware_safety_net_schedule }}` in system-view. Rendered config:
+          {{ comware_rendered_path }}, running config as it was:
+          {{ comware_running_path }}.
+
+- name: comware | disarm the safety net and save
+  ansible.builtin.command:
+    argv: "{{ comware_ssh_argv }}"
+    stdin: |
+      system-view
+      undo scheduler schedule {{ comware_safety_net_schedule }}
+      undo scheduler job {{ comware_safety_net_job }}
+      quit
+      save force
+      quit
+  delegate_to: localhost
+  changed_when: true
+
+- name: comware | applied
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} matches network.yml, the safety net is disarmed
+      and the configuration is saved.

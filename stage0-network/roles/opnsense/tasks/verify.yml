@@ -1,0 +1,11 @@
+---
+# Read-only drift check. It runs the *same* tasks as apply.yml in check mode,
+# so there is exactly one description of the desired state: any object that
+# would change is drift, and the task names say which one.
+
+- name: opnsense | desired state, in check mode
+  ansible.builtin.import_tasks: apply.yml
+  check_mode: true
+
+- name: opnsense | evaluate drift now rather than at the end of the play
+  ansible.builtin.meta: flush_handlers

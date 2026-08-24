@@ -1,0 +1,69 @@
+---
+# ---------------------------------------------------------------------------
+# OPNsense: everything mutable, driven through the REST API (§4.7).
+#
+# NOT managed here, deliberately: interface assignment, the LAN address, the
+# transit gateway object, and enabling the API itself. That is one-time
+# bootstrap done by hand at the console — automating it is where a weekend
+# disappears, and it is the part you need working before Ansible can talk to
+# the box at all. Turn on System > Configuration > Backups > Git as well: it
+# commits config.xml on every change and is how you notice the UI change made
+# at 1am that these playbooks do not know about.
+# ---------------------------------------------------------------------------
+
+# API endpoint and credentials. The key/secret pair comes from the private
+# secrets repo; it needs no more than the pages this role writes to.
+opnsense_url: "https://{{ ansible_host }}"
+opnsense_api_key: "{{ vault_opnsense_api_key }}"
+opnsense_api_secret: "{{ vault_opnsense_api_secret }}"
+opnsense_ssl_verify: true
+
+# OPNsense's *internal* interface identifiers (lan/wan/opt1...), not the
+# descriptive names shown in the UI. `transit` is the /30 to the switch — the
+# single interface every VLAN's traffic arrives on, since the router is in no
+# user subnet.
+opnsense_transit_interface: lan
+opnsense_wan_interface: wan
+
+# Name of the gateway object pointing at the switch (10.100.99.2). Created
+# during the manual bootstrap, referenced by the static route.
+opnsense_transit_gateway: TRANSIT_GW
+
+# Concern switches. Each maps to one task file.
+opnsense_manage_route: true          # 10.100.0.0/16 -> the switch
+opnsense_manage_nat: true            # manual outbound NAT for the supernet
+opnsense_manage_rules: true          # transit + WAN filter rules
+opnsense_manage_dns: true            # Unbound override for the internal zone
+opnsense_manage_dhcp: true           # Kea subnets, matched by relay giaddr
+opnsense_manage_wireguard: false     # peers live in the private secrets repo
+
+# Everything this role creates is tagged with this string in its description,
+# so that objects belonging to the repo are obvious in the UI and can be told
+# apart from anything added by hand.
+opnsense_marker: "stage0-network (managed)"
+
+# The alias holding the supernet. Rules and NAT reference it by name, so the
+# prefix is written once here and once in network.yml, nowhere else.
+opnsense_supernet_alias: homelab_supernet
+
+# Kea endpoints (verify #4 in §12 — Kea replaced ISC dhcpd relatively recently
+# and both the collection and these paths lag behind it in places).
+opnsense_kea_search_path: /api/kea/dhcpv4/searchSubnet
+opnsense_kea_add_path: /api/kea/dhcpv4/addSubnet
+opnsense_kea_reconfigure_path: /api/kea/service/reconfigure
+
+# WireGuard peers: [{ name, public_key, allowed_ips: [...] }]. Keep this in the
+# private secrets repo — a peer public key is not secret, but the peer list is
+# an inventory of who can reach the house.
+opnsense_wireguard_instance: wg0
+opnsense_wireguard_peers: []
+
+opnsense_fail_on_drift: true
+
+# Where this repo's rules start in the transit interface's rule order, leaving
+# room above for anything added by hand.
+opnsense_rule_sequence_base: 1000
+
+# Set by playbooks/verify.yml. Turns a "would change" in check mode into a
+# failed drift check instead of a silent no-op.
+opnsense_verify_mode: false

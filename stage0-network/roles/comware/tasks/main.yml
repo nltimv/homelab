@@ -1,0 +1,6 @@
+---
+# Defaults to the read-only path. Applying is deliberate enough that it is
+# always asked for by name: `tasks_from: apply`, from playbooks/apply.yml.
+
+- name: comware | verify
+  ansible.builtin.import_tasks: verify.yml
