@@ -27,6 +27,7 @@ playbooks/verify.yml           read-only drift check on both devices
 playbooks/apply.yml            converge both devices (explicit confirmation required)
 tools/                         the same rendering, validation and drift check without Ansible
 tests/                         hardware-free tests of all of the above
+ci/                            the GitHub Actions workflow, to be moved into .github/workflows/
 ```
 
 Everything renders from `network.yml`. Without it the VLAN model would be
@@ -35,6 +36,10 @@ route/NAT/rules, Kea subnets, Proxmox `bridge-vids` and VM tags, and Cilium's
 LB-IPAM pool — and they would drift. Later stages read the same file: stage 1
 for `bridge-vids`, stage 2 for node addresses that must sit outside the DHCP and
 LB pools, stage 3 for the `CiliumLoadBalancerIPPool`.
+
+`ci/github-actions-stage0.yml` runs `tools/` and `tests/` on every change; move
+it to `.github/workflows/stage0.yml` to enable it (it could not be pushed there
+from the session that wrote it, which lacked the `workflow` OAuth scope).
 
 ## Prerequisites
 

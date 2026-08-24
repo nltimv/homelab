@@ -1,0 +1,39 @@
+name: stage0-network
+
+# The switch config is applied to the switch you are reaching the switch
+# through, so the useful place to catch a mistake is here, before it is
+# rendered anywhere near the device.
+on:
+  push:
+    paths:
+      - "stage0-network/**"
+      - ".github/workflows/stage0.yml"
+  pull_request:
+    paths:
+      - "stage0-network/**"
+      - ".github/workflows/stage0.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stage0-network
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the two dependencies the tools have
+        run: pip install pyyaml jinja2
+
+      - name: network.yml is internally consistent
+        run: tools/validate.py
+
+      - name: The rendered switch config matches the committed golden file
+        run: tools/render.py --check tests/golden/5130.cfg
+
+      - name: Model, renderer and drift check
+        run: tests/test_stage0.py
