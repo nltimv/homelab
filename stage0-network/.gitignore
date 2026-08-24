@@ -11,3 +11,4 @@ group_vars/all/vault.yml
 # Python bytecode from the stage 0 tools
 __pycache__/
 *.pyc
+.venv
