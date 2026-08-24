@@ -1,8 +1,7 @@
 # Stage 0 — network foundation
 
 Ansible for the two devices every other stage depends on: the **HPE 5130** core
-switch and the **OPNsense** router. See [`docs/PLAN.md` §4](../docs/PLAN.md) for
-the design and the reasoning; this file is how you run it.
+switch and the **OPNsense** router.
 
 Two rules, both load-bearing:
 
@@ -156,14 +155,13 @@ if it was never wanted. Iterate until `--strict` is quiet, and only then apply.
 - **DHCP reservations and household specifics in Kea.** The relayed subnets are
   created if missing; an existing subnet is reported, never rewritten, because
   Kea also holds things this repo does not model.
-- **VLAN 50 (IoT/guest).** Deferred (§4.8) and commented out in `network.yml`,
-  but already permitted on the trunk so enabling it needs no port change.
+- **VLAN 50 (IoT/guest).** Commented out in `network.yml`, but already
+  permitted on the trunk so enabling it needs no port change.
 - **Suricata, aliases and any north-south policy beyond per-VLAN egress.**
 
 ## Confirm against your own firmware
 
-These are the assumptions this code makes about hardware it cannot ask
-(`docs/PLAN.md` §12):
+These are the assumptions this code makes about hardware it cannot ask:
 
 | # | Assumption | Where it bites |
 |---|---|---|
